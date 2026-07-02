@@ -1,0 +1,841 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+01_preprocesamiento_y_ciclos.py
+
+Primera parte del pipeline para análisis de marcha con DeepLabCut.
+Este script SOLO hace:
+
+1. Leer archivo .h5 o .csv filtrado de DeepLabCut.
+2. Extraer crest, hip, knee, ankle, foot y toe.
+3. Filtrar coordenadas por likelihood.
+4. Interpolar gaps cortos.
+5. Suavizar coordenadas.
+6. Detectar ciclos de marcha usando toe o foot.
+7. Normalizar cada ciclo aceptado a 0-100%.
+8. Exportar archivos de control.
+
+No calcula ángulos, stance, swing, toe clearance final ni estadística.
+
+Uso recomendado:
+    python 01_preprocesamiento_y_ciclos.py "archivo_filtrado.h5" --outdir salida_ciclos
+
+Ejemplo con 30 FPS:
+    python 01_preprocesamiento_y_ciclos.py "raton 1DLC_resnet50_EntrenamientoMay18shuffle1_50000.h5" --fps 30
+
+Autor: pipeline preparado para análisis DLC de marcha murina.
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+try:
+    from scipy.signal import find_peaks
+    SCIPY_AVAILABLE = True
+except Exception:
+    SCIPY_AVAILABLE = False
+
+
+# =============================================================================
+# PARAMETROS EDITABLES
+# =============================================================================
+
+FPS = 30
+
+BODY_PARTS = ["crest", "hip", "knee", "ankle", "foot", "toe"]
+COORDS = ["x", "y", "likelihood"]
+
+# Puntos con likelihood menor a este valor se convierten en NaN antes de interpolar.
+LIKELIHOOD_MIN = 0.80
+
+# Solo se interpolan gaps de esta longitud o menores.
+# A 30 FPS, 5 frames equivalen a 0.167 s.
+MAX_GAP_INTERPOLATION = 5
+
+# Ventana de suavizado. Debe ser impar.
+# A 30 FPS, 5 frames equivalen a 0.167 s.
+SMOOTH_WINDOW = 5
+
+# Punto usado para detectar ciclos.
+# Recomendado inicialmente: "toe". Si falla, probar "foot".
+BODY_PART_FOR_CYCLE = "toe"
+
+# Coordenada usada para detectar contactos.
+# En vista lateral normalmente se usa "y".
+EVENT_COORD = "y"
+
+# Polaridad del evento.
+# "max": detecta picos positivos. En imágenes, si el eje Y aumenta hacia abajo,
+#        el contacto con la cinta suele aparecer como valores altos de y.
+# "min": detecta valles. Usar si el grafico muestra que los contactos son mínimos.
+EVENT_POLARITY = "max"
+
+# Duración fisiológica permitida de un ciclo.
+# A 30 FPS:
+#   0.20 s = 6 frames
+#   1.50 s = 45 frames
+MIN_CYCLE_DURATION_S = 0.20
+MAX_CYCLE_DURATION_S = 1.50
+
+# Si queda como None, se calcula automáticamente desde la señal.
+# Si hay sobreestimación de ciclos, subir este valor.
+# Si hay subestimación de ciclos, bajarlo.
+DETECTION_PROMINENCE_PX: Optional[float] = None
+MIN_PROMINENCE_PX = 2.0
+PROMINENCE_SD_FACTOR = 0.25
+
+# Un ciclo se rechaza si tiene demasiados NaN en la señal usada para detectar.
+MAX_CYCLE_NAN_FRACTION = 0.20
+
+# Un ciclo se rechaza si la señal vertical casi no cambia.
+# Si se rechazan ciclos válidos, bajar este valor.
+MIN_CYCLE_SIGNAL_RANGE_PX = 3.0
+
+# Cantidad de puntos para normalizar cada ciclo.
+# 101 equivale a 0, 1, 2, ..., 100%.
+NORM_POINTS = 101
+
+# Si True, además de guardar archivos, muestra el gráfico al terminar.
+SHOW_PLOT = False
+
+
+# =============================================================================
+# LECTURA DE ARCHIVOS DLC
+# =============================================================================
+
+def read_dlc_file(file_path: Path) -> pd.DataFrame:
+    """Lee un archivo .h5 o .csv de DeepLabCut con encabezado multi-index."""
+    suffix = file_path.suffix.lower()
+
+    if suffix in [".h5", ".hdf5"]:
+        df = pd.read_hdf(file_path)
+    elif suffix == ".csv":
+        df = pd.read_csv(file_path, header=[0, 1, 2], index_col=0)
+    else:
+        raise ValueError(f"Formato no soportado: {suffix}. Usar .h5, .hdf5 o .csv")
+
+    if not isinstance(df.columns, pd.MultiIndex):
+        raise ValueError(
+            "El archivo no tiene columnas MultiIndex de DeepLabCut. "
+            "Se esperaba estructura scorer/bodyparts/coords."
+        )
+
+    if df.columns.nlevels < 3:
+        raise ValueError(
+            "El archivo parece tener menos de 3 niveles de columnas. "
+            "Se esperaba scorer/bodyparts/coords."
+        )
+
+    # Estandarizar nombres de niveles si vienen sin nombre.
+    names = list(df.columns.names)
+    default_names = ["scorer", "bodyparts", "coords"]
+    for i in range(min(3, len(names))):
+        if names[i] is None:
+            names[i] = default_names[i]
+    df.columns = df.columns.set_names(names)
+
+    return df
+
+
+def extract_dlc_bodyparts(df: pd.DataFrame, bodyparts: List[str]) -> pd.DataFrame:
+    """
+    Extrae bodyparts requeridos desde un dataframe DLC y devuelve columnas planas:
+    crest_x, crest_y, crest_likelihood, hip_x, etc.
+    """
+    col_names = list(df.columns.names)
+
+    try:
+        bp_level = col_names.index("bodyparts")
+        coord_level = col_names.index("coords")
+    except ValueError:
+        # DeepLabCut normalmente usa niveles 1 y 2.
+        bp_level = 1
+        coord_level = 2
+
+    available_bodyparts = set(df.columns.get_level_values(bp_level).astype(str))
+    missing = [bp for bp in bodyparts if bp not in available_bodyparts]
+    if missing:
+        raise ValueError(
+            "Faltan puntos anatómicos en el archivo DLC: "
+            + ", ".join(missing)
+            + f". Disponibles: {sorted(available_bodyparts)}"
+        )
+
+    out = pd.DataFrame(index=df.index.copy())
+    out.index.name = "frame"
+
+    for bp in bodyparts:
+        bp_df = df.xs(bp, axis=1, level=bp_level)
+        bp_coords = set(bp_df.columns.get_level_values(-1).astype(str)) if isinstance(bp_df.columns, pd.MultiIndex) else set(bp_df.columns.astype(str))
+
+        for coord in COORDS:
+            if coord not in bp_coords:
+                raise ValueError(f"Falta coordenada '{coord}' para bodypart '{bp}'.")
+
+            if isinstance(bp_df.columns, pd.MultiIndex):
+                coord_df = bp_df.xs(coord, axis=1, level=-1)
+                series = coord_df.iloc[:, 0]
+            else:
+                series = bp_df[coord]
+
+            out[f"{bp}_{coord}_raw"] = pd.to_numeric(series, errors="coerce")
+
+    return out
+
+
+# =============================================================================
+# LIMPIEZA, INTERPOLACION Y SUAVIZADO
+# =============================================================================
+
+def interpolate_short_gaps(series: pd.Series, max_gap: int) -> pd.Series:
+    """
+    Interpola solo gaps de longitud <= max_gap.
+    Gaps más largos permanecen como NaN completos.
+    """
+    s = series.astype(float).copy()
+    na = s.isna().to_numpy()
+
+    if not na.any():
+        return s
+
+    interpolated = s.interpolate(method="linear", limit_area="inside")
+    result = s.copy()
+
+    n = len(s)
+    i = 0
+    while i < n:
+        if not na[i]:
+            i += 1
+            continue
+
+        start = i
+        while i < n and na[i]:
+            i += 1
+        end = i  # exclusivo
+        gap_len = end - start
+
+        has_left = start > 0 and not na[start - 1]
+        has_right = end < n and not na[end]
+
+        if has_left and has_right and gap_len <= max_gap:
+            result.iloc[start:end] = interpolated.iloc[start:end]
+
+    return result
+
+
+def centered_smooth(series: pd.Series, window: int) -> pd.Series:
+    """
+    Suavizado robusto: mediana centrada seguida de media centrada.
+    No rellena gaps largos.
+    """
+    if window <= 1:
+        return series.astype(float)
+
+    if window % 2 == 0:
+        window += 1
+
+    s = series.astype(float)
+    med = s.rolling(window=window, center=True, min_periods=1).median()
+    smooth = med.rolling(window=window, center=True, min_periods=1).mean()
+    return smooth
+
+
+def clean_coordinates(
+    raw: pd.DataFrame,
+    bodyparts: List[str],
+    fps: float,
+    likelihood_min: float,
+    max_gap: int,
+    smooth_window: int,
+) -> pd.DataFrame:
+    """
+    Filtra por likelihood, interpola gaps cortos y suaviza coordenadas.
+    Devuelve raw + columnas limpias finales bp_x, bp_y, bp_likelihood.
+    """
+    clean = pd.DataFrame(index=raw.index.copy())
+    clean.index.name = "frame"
+    clean["time_s"] = clean.index.to_numpy(dtype=float) / float(fps)
+
+    for bp in bodyparts:
+        x_raw = raw[f"{bp}_x_raw"].astype(float)
+        y_raw = raw[f"{bp}_y_raw"].astype(float)
+        likelihood = raw[f"{bp}_likelihood_raw"].astype(float)
+
+        valid_likelihood = likelihood >= likelihood_min
+
+        x_filtered = x_raw.where(valid_likelihood, np.nan)
+        y_filtered = y_raw.where(valid_likelihood, np.nan)
+
+        x_interp = interpolate_short_gaps(x_filtered, max_gap=max_gap)
+        y_interp = interpolate_short_gaps(y_filtered, max_gap=max_gap)
+
+        x_smooth = centered_smooth(x_interp, window=smooth_window)
+        y_smooth = centered_smooth(y_interp, window=smooth_window)
+
+        clean[f"{bp}_x_raw"] = x_raw
+        clean[f"{bp}_y_raw"] = y_raw
+        clean[f"{bp}_likelihood"] = likelihood
+        clean[f"{bp}_valid_likelihood"] = valid_likelihood.astype(int)
+        clean[f"{bp}_x"] = x_smooth
+        clean[f"{bp}_y"] = y_smooth
+
+    return clean
+
+
+# =============================================================================
+# DETECCION DE CICLOS
+# =============================================================================
+
+def robust_nanstd(signal: np.ndarray) -> float:
+    finite = np.asarray(signal, dtype=float)
+    finite = finite[np.isfinite(finite)]
+    if finite.size < 2:
+        return 0.0
+    return float(np.nanstd(finite))
+
+
+def auto_prominence(signal: np.ndarray) -> float:
+    sd = robust_nanstd(signal)
+    return max(MIN_PROMINENCE_PX, sd * PROMINENCE_SD_FACTOR)
+
+
+def contiguous_finite_segments(signal: np.ndarray) -> List[Tuple[int, int]]:
+    """Devuelve segmentos [start, end) donde la señal es finita."""
+    finite = np.isfinite(signal)
+    segments = []
+    n = len(signal)
+    i = 0
+    while i < n:
+        if not finite[i]:
+            i += 1
+            continue
+        start = i
+        while i < n and finite[i]:
+            i += 1
+        end = i
+        segments.append((start, end))
+    return segments
+
+
+def simple_peak_finder(signal: np.ndarray, distance: int, prominence: float) -> np.ndarray:
+    """
+    Detector simple de picos si scipy no está disponible.
+    Menos preciso que scipy.signal.find_peaks, pero funcional.
+    """
+    candidates = []
+    n = len(signal)
+    for i in range(1, n - 1):
+        if not np.isfinite(signal[i - 1:i + 2]).all():
+            continue
+        if signal[i] > signal[i - 1] and signal[i] >= signal[i + 1]:
+            left_min = np.nanmin(signal[max(0, i - distance):i + 1])
+            right_min = np.nanmin(signal[i:min(n, i + distance + 1)])
+            local_prom = signal[i] - max(left_min, right_min)
+            if local_prom >= prominence:
+                candidates.append(i)
+
+    if not candidates:
+        return np.array([], dtype=int)
+
+    # Aplicar distancia mínima conservando el pico más alto.
+    candidates = sorted(candidates, key=lambda idx: signal[idx], reverse=True)
+    accepted = []
+    for idx in candidates:
+        if all(abs(idx - a) >= distance for a in accepted):
+            accepted.append(idx)
+
+    return np.array(sorted(accepted), dtype=int)
+
+
+def detect_events(
+    clean: pd.DataFrame,
+    bodypart: str,
+    coord: str,
+    fps: float,
+    polarity: str,
+    min_cycle_s: float,
+    prominence_px: Optional[float],
+) -> Tuple[pd.DataFrame, np.ndarray, float]:
+    """Detecta eventos candidatos de contacto usando picos de la señal seleccionada."""
+    signal_col = f"{bodypart}_{coord}"
+    if signal_col not in clean.columns:
+        raise ValueError(f"No existe la columna {signal_col}.")
+
+    raw_signal = clean[signal_col].to_numpy(dtype=float)
+
+    if polarity not in ["max", "min"]:
+        raise ValueError("EVENT_POLARITY debe ser 'max' o 'min'.")
+
+    detection_signal = raw_signal.copy()
+    if polarity == "min":
+        detection_signal = -detection_signal
+
+    min_distance_frames = max(1, int(round(min_cycle_s * fps)))
+    prominence = auto_prominence(detection_signal) if prominence_px is None else float(prominence_px)
+
+    all_peaks = []
+    segments = contiguous_finite_segments(detection_signal)
+
+    for start, end in segments:
+        seg = detection_signal[start:end]
+        if len(seg) < max(3, min_distance_frames):
+            continue
+
+        if SCIPY_AVAILABLE:
+            peaks, _ = find_peaks(seg, distance=min_distance_frames, prominence=prominence)
+        else:
+            peaks = simple_peak_finder(seg, distance=min_distance_frames, prominence=prominence)
+
+        if len(peaks) > 0:
+            all_peaks.extend((peaks + start).tolist())
+
+    all_peaks = np.array(sorted(set(all_peaks)), dtype=int)
+
+    events = pd.DataFrame({
+        "event_id": np.arange(1, len(all_peaks) + 1, dtype=int),
+        "frame": all_peaks,
+        "time_s": all_peaks / float(fps),
+        "bodypart": bodypart,
+        "coord": coord,
+        "polarity": polarity,
+        "signal_value": raw_signal[all_peaks] if len(all_peaks) else [],
+        "prominence_px_used": prominence,
+    })
+
+    return events, raw_signal, prominence
+
+
+def build_cycles_from_events(
+    events: pd.DataFrame,
+    clean: pd.DataFrame,
+    signal: np.ndarray,
+    fps: float,
+    min_cycle_s: float,
+    max_cycle_s: float,
+    max_nan_fraction: float,
+    min_signal_range_px: float,
+) -> pd.DataFrame:
+    """Construye y filtra ciclos entre eventos consecutivos."""
+    if events.empty or len(events) < 2:
+        return pd.DataFrame(columns=[
+            "cycle_id", "start_event_id", "end_event_id", "start_frame", "end_frame",
+            "start_time_s", "end_time_s", "duration_frames", "duration_s",
+            "valid_fraction_signal", "nan_fraction_signal", "signal_range_px", "accepted", "reject_reason"
+        ])
+
+    frames = events["frame"].to_numpy(dtype=int)
+    event_ids = events["event_id"].to_numpy(dtype=int)
+
+    min_frames = int(round(min_cycle_s * fps))
+    max_frames = int(round(max_cycle_s * fps))
+
+    rows = []
+    cycle_counter = 0
+
+    for i in range(len(frames) - 1):
+        start = int(frames[i])
+        end = int(frames[i + 1])
+        duration_frames = end - start
+        duration_s = duration_frames / float(fps)
+
+        segment = signal[start:end + 1]
+        finite = np.isfinite(segment)
+        valid_fraction = float(finite.mean()) if len(segment) else 0.0
+        nan_fraction = 1.0 - valid_fraction
+        signal_range = float(np.nanmax(segment) - np.nanmin(segment)) if finite.any() else np.nan
+
+        accepted = True
+        reasons = []
+
+        if duration_frames < min_frames:
+            accepted = False
+            reasons.append("ciclo_demasiado_corto")
+
+        if duration_frames > max_frames:
+            accepted = False
+            reasons.append("ciclo_demasiado_largo")
+
+        if nan_fraction > max_nan_fraction:
+            accepted = False
+            reasons.append("demasiados_nan")
+
+        if not np.isfinite(signal_range) or signal_range < min_signal_range_px:
+            accepted = False
+            reasons.append("rango_senal_insuficiente")
+
+        if accepted:
+            cycle_counter += 1
+            cycle_id = cycle_counter
+        else:
+            cycle_id = np.nan
+
+        rows.append({
+            "cycle_id": cycle_id,
+            "start_event_id": int(event_ids[i]),
+            "end_event_id": int(event_ids[i + 1]),
+            "start_frame": start,
+            "end_frame": end,
+            "start_time_s": start / float(fps),
+            "end_time_s": end / float(fps),
+            "duration_frames": int(duration_frames),
+            "duration_s": float(duration_s),
+            "valid_fraction_signal": valid_fraction,
+            "nan_fraction_signal": nan_fraction,
+            "signal_range_px": signal_range,
+            "accepted": int(accepted),
+            "reject_reason": ";".join(reasons) if reasons else "",
+        })
+
+    cycles = pd.DataFrame(rows)
+    return cycles
+
+
+# =============================================================================
+# NORMALIZACION DE CICLOS
+# =============================================================================
+
+def normalize_one_signal(frames: np.ndarray, values: np.ndarray, norm_percent: np.ndarray) -> np.ndarray:
+    """Normaliza una señal de un ciclo a 0-100% usando interpolación lineal."""
+    values = np.asarray(values, dtype=float)
+    frames = np.asarray(frames, dtype=float)
+
+    if len(values) < 2:
+        return np.full_like(norm_percent, np.nan, dtype=float)
+
+    cycle_percent = (frames - frames[0]) / (frames[-1] - frames[0]) * 100.0
+    finite = np.isfinite(values)
+
+    if finite.sum() < 2:
+        return np.full_like(norm_percent, np.nan, dtype=float)
+
+    return np.interp(norm_percent, cycle_percent[finite], values[finite])
+
+
+def normalize_cycles(
+    clean: pd.DataFrame,
+    cycles: pd.DataFrame,
+    bodyparts: List[str],
+    norm_points: int,
+) -> pd.DataFrame:
+    """Normaliza los ciclos aceptados a 0-100% en formato ancho."""
+    accepted = cycles[cycles["accepted"] == 1].copy()
+    if accepted.empty:
+        return pd.DataFrame()
+
+    norm_percent = np.linspace(0, 100, norm_points)
+    rows = []
+
+    for _, cyc in accepted.iterrows():
+        cycle_id = int(cyc["cycle_id"])
+        start = int(cyc["start_frame"])
+        end = int(cyc["end_frame"])
+
+        cycle_frames = np.arange(start, end + 1, dtype=int)
+        row_base = {
+            "cycle_id": cycle_id,
+            "start_frame": start,
+            "end_frame": end,
+            "duration_frames": int(cyc["duration_frames"]),
+            "duration_s": float(cyc["duration_s"]),
+        }
+
+        temp = pd.DataFrame({"percent_gait_cycle": norm_percent})
+        for key, val in row_base.items():
+            temp[key] = val
+
+        for bp in bodyparts:
+            for coord in ["x", "y"]:
+                col = f"{bp}_{coord}"
+                values = clean.loc[cycle_frames, col].to_numpy(dtype=float)
+                temp[col] = normalize_one_signal(cycle_frames, values, norm_percent)
+
+        # Ordenar columnas para que identificadores queden primero.
+        first_cols = ["cycle_id", "percent_gait_cycle", "start_frame", "end_frame", "duration_frames", "duration_s"]
+        other_cols = [c for c in temp.columns if c not in first_cols]
+        temp = temp[first_cols + other_cols]
+
+        rows.append(temp)
+
+    normalized = pd.concat(rows, ignore_index=True)
+    return normalized
+
+
+# =============================================================================
+# GRAFICO DE CONTROL
+# =============================================================================
+
+def plot_cycle_detection_check(
+    clean: pd.DataFrame,
+    events: pd.DataFrame,
+    cycles: pd.DataFrame,
+    signal: np.ndarray,
+    bodypart: str,
+    coord: str,
+    polarity: str,
+    prominence: float,
+    output_png: Path,
+    show: bool = False,
+) -> None:
+    """Guarda un gráfico para revisar visualmente los eventos y ciclos detectados."""
+    frames = clean.index.to_numpy(dtype=int)
+
+    plt.figure(figsize=(16, 6))
+    plt.plot(frames, signal, linewidth=1.2, label=f"{bodypart}_{coord} limpio")
+
+    if not events.empty:
+        event_frames = events["frame"].to_numpy(dtype=int)
+        plt.scatter(event_frames, signal[event_frames], s=30, label="eventos detectados")
+
+    if not cycles.empty:
+        accepted = cycles[cycles["accepted"] == 1]
+        rejected = cycles[cycles["accepted"] == 0]
+
+        for _, row in accepted.iterrows():
+            plt.axvspan(int(row["start_frame"]), int(row["end_frame"]), alpha=0.10)
+
+        for _, row in rejected.iterrows():
+            plt.axvline(int(row["start_frame"]), linestyle="--", linewidth=0.8, alpha=0.35)
+
+    title = (
+        f"Control deteccion ciclos | senal={bodypart}_{coord} | "
+        f"polaridad={polarity} | prominencia={prominence:.2f}px | "
+        f"ciclos aceptados={(cycles['accepted'] == 1).sum() if not cycles.empty else 0}"
+    )
+    plt.title(title)
+    plt.xlabel("Frame")
+    plt.ylabel(f"{bodypart}_{coord} px")
+    plt.legend(loc="best")
+    plt.tight_layout()
+    plt.savefig(output_png, dpi=200)
+
+    if show:
+        plt.show()
+    plt.close()
+
+
+# =============================================================================
+# EXPORTACION Y PIPELINE PRINCIPAL
+# =============================================================================
+
+def safe_stem(file_path: Path) -> str:
+    """Genera un stem seguro para nombres de salida."""
+    return file_path.stem.replace(" ", "_")
+
+
+def run_pipeline(
+    input_file: Path,
+    outdir: Path,
+    fps: float = FPS,
+    likelihood_min: float = LIKELIHOOD_MIN,
+    max_gap: int = MAX_GAP_INTERPOLATION,
+    smooth_window: int = SMOOTH_WINDOW,
+    cycle_bodypart: str = BODY_PART_FOR_CYCLE,
+    event_coord: str = EVENT_COORD,
+    event_polarity: str = EVENT_POLARITY,
+    min_cycle_s: float = MIN_CYCLE_DURATION_S,
+    max_cycle_s: float = MAX_CYCLE_DURATION_S,
+    prominence_px: Optional[float] = DETECTION_PROMINENCE_PX,
+    max_nan_fraction: float = MAX_CYCLE_NAN_FRACTION,
+    min_signal_range_px: float = MIN_CYCLE_SIGNAL_RANGE_PX,
+    norm_points: int = NORM_POINTS,
+    show_plot: bool = SHOW_PLOT,
+) -> Dict[str, Path]:
+    """Ejecuta la primera parte completa del pipeline."""
+    input_file = Path(input_file)
+    outdir = Path(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    if not input_file.exists():
+        raise FileNotFoundError(f"No existe el archivo: {input_file}")
+
+    if cycle_bodypart not in BODY_PARTS:
+        raise ValueError(f"cycle_bodypart debe ser uno de: {BODY_PARTS}")
+
+    if event_coord not in ["x", "y"]:
+        raise ValueError("event_coord debe ser 'x' o 'y'.")
+
+    stem = safe_stem(input_file)
+
+    print("\n=== 01 PREPROCESAMIENTO Y DETECCION DE CICLOS ===")
+    print(f"Archivo entrada: {input_file}")
+    print(f"Carpeta salida:  {outdir}")
+    print(f"FPS: {fps}")
+    print(f"Likelihood minimo: {likelihood_min}")
+    print(f"Punto deteccion: {cycle_bodypart}_{event_coord}, polaridad={event_polarity}")
+
+    dlc_df = read_dlc_file(input_file)
+    raw = extract_dlc_bodyparts(dlc_df, BODY_PARTS)
+    clean = clean_coordinates(
+        raw=raw,
+        bodyparts=BODY_PARTS,
+        fps=fps,
+        likelihood_min=likelihood_min,
+        max_gap=max_gap,
+        smooth_window=smooth_window,
+    )
+
+    events, signal, prominence_used = detect_events(
+        clean=clean,
+        bodypart=cycle_bodypart,
+        coord=event_coord,
+        fps=fps,
+        polarity=event_polarity,
+        min_cycle_s=min_cycle_s,
+        prominence_px=prominence_px,
+    )
+
+    cycles = build_cycles_from_events(
+        events=events,
+        clean=clean,
+        signal=signal,
+        fps=fps,
+        min_cycle_s=min_cycle_s,
+        max_cycle_s=max_cycle_s,
+        max_nan_fraction=max_nan_fraction,
+        min_signal_range_px=min_signal_range_px,
+    )
+
+    normalized = normalize_cycles(
+        clean=clean,
+        cycles=cycles,
+        bodyparts=BODY_PARTS,
+        norm_points=norm_points,
+    )
+
+    # Archivos de salida.
+    clean_csv = outdir / f"{stem}_clean_coords.csv"
+    events_csv = outdir / f"{stem}_events_detected.csv"
+    cycles_csv = outdir / f"{stem}_gait_cycles.csv"
+    normalized_csv = outdir / f"{stem}_normalized_cycles.csv"
+    check_png = outdir / f"{stem}_cycle_detection_check.png"
+    params_txt = outdir / f"{stem}_params.txt"
+
+    clean.to_csv(clean_csv, index=True)
+    events.to_csv(events_csv, index=False)
+    cycles.to_csv(cycles_csv, index=False)
+    normalized.to_csv(normalized_csv, index=False)
+
+    plot_cycle_detection_check(
+        clean=clean,
+        events=events,
+        cycles=cycles,
+        signal=signal,
+        bodypart=cycle_bodypart,
+        coord=event_coord,
+        polarity=event_polarity,
+        prominence=prominence_used,
+        output_png=check_png,
+        show=show_plot,
+    )
+
+    with open(params_txt, "w", encoding="utf-8") as f:
+        f.write("01_preprocesamiento_y_ciclos.py\n")
+        f.write(f"input_file = {input_file}\n")
+        f.write(f"fps = {fps}\n")
+        f.write(f"bodyparts = {BODY_PARTS}\n")
+        f.write(f"likelihood_min = {likelihood_min}\n")
+        f.write(f"max_gap_interpolation = {max_gap}\n")
+        f.write(f"smooth_window = {smooth_window}\n")
+        f.write(f"cycle_bodypart = {cycle_bodypart}\n")
+        f.write(f"event_coord = {event_coord}\n")
+        f.write(f"event_polarity = {event_polarity}\n")
+        f.write(f"min_cycle_duration_s = {min_cycle_s}\n")
+        f.write(f"max_cycle_duration_s = {max_cycle_s}\n")
+        f.write(f"prominence_px_used = {prominence_used}\n")
+        f.write(f"max_cycle_nan_fraction = {max_nan_fraction}\n")
+        f.write(f"min_cycle_signal_range_px = {min_signal_range_px}\n")
+        f.write(f"norm_points = {norm_points}\n")
+        f.write(f"scipy_available = {SCIPY_AVAILABLE}\n")
+
+    n_events = len(events)
+    n_cycles_total = len(cycles)
+    n_cycles_ok = int((cycles["accepted"] == 1).sum()) if not cycles.empty else 0
+    n_cycles_bad = n_cycles_total - n_cycles_ok
+
+    print("\nResumen:")
+    print(f"  Eventos detectados:      {n_events}")
+    print(f"  Ciclos construidos:      {n_cycles_total}")
+    print(f"  Ciclos aceptados:        {n_cycles_ok}")
+    print(f"  Ciclos rechazados:       {n_cycles_bad}")
+    print(f"  Prominencia usada:       {prominence_used:.3f} px")
+    print("\nArchivos generados:")
+    print(f"  {clean_csv}")
+    print(f"  {events_csv}")
+    print(f"  {cycles_csv}")
+    print(f"  {normalized_csv}")
+    print(f"  {check_png}")
+    print(f"  {params_txt}")
+    print("\nIMPORTANTE: revisar visualmente el PNG antes de usar los ciclos en otros scripts.\n")
+
+    return {
+        "clean_coords": clean_csv,
+        "events_detected": events_csv,
+        "gait_cycles": cycles_csv,
+        "normalized_cycles": normalized_csv,
+        "cycle_detection_check": check_png,
+        "params": params_txt,
+    }
+
+
+def build_argparser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Primera parte: leer DLC, limpiar coordenadas, detectar ciclos y normalizar 0-100%."
+    )
+    parser.add_argument("input_file", type=str, help="Archivo .h5 o .csv filtrado de DeepLabCut.")
+    parser.add_argument("--outdir", type=str, default="salida_01_ciclos", help="Carpeta de salida.")
+    parser.add_argument("--fps", type=float, default=FPS, help="Frames por segundo del video. Default: 30.")
+    parser.add_argument("--likelihood", type=float, default=LIKELIHOOD_MIN, help="Likelihood minimo. Default: 0.80.")
+    parser.add_argument("--max-gap", type=int, default=MAX_GAP_INTERPOLATION, help="Maximo gap a interpolar en frames. Default: 5.")
+    parser.add_argument("--smooth-window", type=int, default=SMOOTH_WINDOW, help="Ventana de suavizado. Default: 5.")
+    parser.add_argument("--cycle-bodypart", type=str, default=BODY_PART_FOR_CYCLE, choices=BODY_PARTS, help="Punto para detectar ciclos.")
+    parser.add_argument("--event-coord", type=str, default=EVENT_COORD, choices=["x", "y"], help="Coordenada para detectar eventos.")
+    parser.add_argument("--polarity", type=str, default=EVENT_POLARITY, choices=["max", "min"], help="Detectar maximos o minimos.")
+    parser.add_argument("--min-cycle-s", type=float, default=MIN_CYCLE_DURATION_S, help="Duracion minima de ciclo en segundos.")
+    parser.add_argument("--max-cycle-s", type=float, default=MAX_CYCLE_DURATION_S, help="Duracion maxima de ciclo en segundos.")
+    parser.add_argument("--prominence", type=float, default=None, help="Prominencia en px. Si se omite, se calcula automaticamente.")
+    parser.add_argument("--max-nan-fraction", type=float, default=MAX_CYCLE_NAN_FRACTION, help="Fraccion maxima de NaN permitida por ciclo.")
+    parser.add_argument("--min-signal-range", type=float, default=MIN_CYCLE_SIGNAL_RANGE_PX, help="Rango minimo de senal en px por ciclo.")
+    parser.add_argument("--norm-points", type=int, default=NORM_POINTS, help="Puntos para normalizar ciclo. Default: 101.")
+    parser.add_argument("--show-plot", action="store_true", help="Mostrar grafico al terminar.")
+    return parser
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = build_argparser()
+    args = parser.parse_args(argv)
+
+    try:
+        run_pipeline(
+            input_file=Path(args.input_file),
+            outdir=Path(args.outdir),
+            fps=args.fps,
+            likelihood_min=args.likelihood,
+            max_gap=args.max_gap,
+            smooth_window=args.smooth_window,
+            cycle_bodypart=args.cycle_bodypart,
+            event_coord=args.event_coord,
+            event_polarity=args.polarity,
+            min_cycle_s=args.min_cycle_s,
+            max_cycle_s=args.max_cycle_s,
+            prominence_px=args.prominence,
+            max_nan_fraction=args.max_nan_fraction,
+            min_signal_range_px=args.min_signal_range,
+            norm_points=args.norm_points,
+            show_plot=args.show_plot,
+        )
+        return 0
+    except Exception as exc:
+        print(f"\nERROR: {exc}\n", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
