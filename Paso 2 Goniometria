@@ -22,10 +22,11 @@ Este script hace:
     5. Recortar perfiles angulares por ciclo.
     6. Normalizar perfiles angulares a 0-100% del ciclo.
     7. Exportar perfiles angulares por ciclo.
-    8. Calcular rangos angulares por ciclo.
+    8. Calcular rangos angulares por ciclo: max - min.
     9. Exportar rangos angulares por ciclo.
-   10. Graficar perfiles angulares.
-   11. Graficar control de ciclos sobre señales angulares.
+   10. Exportar resumen por video de rangos: media, D.E. y S.E.M.
+   11. Graficar perfiles angulares.
+   12. Graficar control de ciclos sobre señales angulares.
 
 Este script NO detecta ciclos nuevos, NO calcula stance/swing, NO calcula toe clearance
 final y NO hace estadística grupal.
@@ -402,6 +403,50 @@ def calculate_cycle_angle_ranges(
     return pd.DataFrame(rows)
 
 
+def calculate_angle_range_summary(ranges: pd.DataFrame) -> pd.DataFrame:
+    """
+    Resume los rangos angulares por video.
+
+    Importante:
+    - La unidad estadística aquí son los ciclos válidos dentro del video.
+    - Para análisis grupal posterior, usar una fila por video/animal/estadio,
+      no cada ciclo como observación independiente.
+    - El S.E.M. se calcula como D.E. / sqrt(n).
+    """
+    row: Dict[str, object] = {
+        "n_cycles_total": int(len(ranges)),
+    }
+
+    for angle_name in ANGLE_NAMES:
+        col = f"{angle_name}_range_deg"
+        if col not in ranges.columns:
+            row[f"{angle_name}_range_n_valid"] = 0
+            row[f"{angle_name}_range_mean_deg"] = np.nan
+            row[f"{angle_name}_range_sd_deg"] = np.nan
+            row[f"{angle_name}_range_sem_deg"] = np.nan
+            continue
+
+        values = pd.to_numeric(ranges[col], errors="coerce").dropna().to_numpy(dtype=float)
+        n = int(len(values))
+        row[f"{angle_name}_range_n_valid"] = n
+
+        if n == 0:
+            row[f"{angle_name}_range_mean_deg"] = np.nan
+            row[f"{angle_name}_range_sd_deg"] = np.nan
+            row[f"{angle_name}_range_sem_deg"] = np.nan
+        elif n == 1:
+            row[f"{angle_name}_range_mean_deg"] = float(values[0])
+            row[f"{angle_name}_range_sd_deg"] = np.nan
+            row[f"{angle_name}_range_sem_deg"] = np.nan
+        else:
+            sd = float(np.std(values, ddof=1))
+            row[f"{angle_name}_range_mean_deg"] = float(np.mean(values))
+            row[f"{angle_name}_range_sd_deg"] = sd
+            row[f"{angle_name}_range_sem_deg"] = float(sd / np.sqrt(n))
+
+    return pd.DataFrame([row])
+
+
 # =============================================================================
 # GRAFICOS
 # =============================================================================
@@ -572,13 +617,17 @@ def run_pipeline(
     frame_angles_csv = outdir / f"{stem}_frame_angles.csv"
     profiles_csv = outdir / f"{stem}_cycle_angle_profiles.csv"
     ranges_csv = outdir / f"{stem}_cycle_angle_ranges.csv"
+    range_summary_csv = outdir / f"{stem}_angle_range_summary.csv"
     profiles_png = outdir / f"{stem}_angle_profiles.png"
     control_png = outdir / f"{stem}_angle_cycle_control.png"
     params_txt = outdir / f"{stem}_goniometry_params.txt"
 
     angles.to_csv(frame_angles_csv, index=True)
     profiles.to_csv(profiles_csv, index=False)
+    range_summary = calculate_angle_range_summary(ranges)
+
     ranges.to_csv(ranges_csv, index=False)
+    range_summary.to_csv(range_summary_csv, index=False)
 
     plot_angle_profiles(profiles, profiles_png, show=show_plots)
     plot_angle_cycle_control(angles, cycles, control_png, show=show_plots)
@@ -599,11 +648,13 @@ def run_pipeline(
     print(f"  Ciclos angulares analizados:    {len(cycles)}")
     print(f"  Filas perfiles normalizados:    {len(profiles)}")
     print(f"  Filas rangos por ciclo:         {len(ranges)}")
+    print("  Resumen de rangos:              media, D.E. y S.E.M. por video")
 
     print("\nArchivos generados:")
     print(f"  {frame_angles_csv}")
     print(f"  {profiles_csv}")
     print(f"  {ranges_csv}")
+    print(f"  {range_summary_csv}")
     print(f"  {profiles_png}")
     print(f"  {control_png}")
     print(f"  {params_txt}")
@@ -613,6 +664,7 @@ def run_pipeline(
         "frame_angles": frame_angles_csv,
         "cycle_angle_profiles": profiles_csv,
         "cycle_angle_ranges": ranges_csv,
+        "angle_range_summary": range_summary_csv,
         "angle_profiles_png": profiles_png,
         "angle_cycle_control_png": control_png,
         "params": params_txt,
