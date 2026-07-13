@@ -15,18 +15,20 @@ Este script SOLO hace:
 7. Normalizar cada ciclo aceptado a 0-100%.
 8. Exportar archivos de control.
 
-Versión actual:
+Versión corregida de fase:
 - Método principal: distal_x.
 - Usa toe + foot como señal distal combinada.
 - Detecta eventos por extremos de la posición horizontal distal y velocidad.
+- Para este montaje experimental/cámara, el foot strike se fija en el mínimo de distal_x.
+- Se evita usar auto como valor por defecto porque puede elegir el extremo opuesto y desfasar el 0% del ciclo.
 - hip/knee/ankle NO definen contacto; se exportan como señales auxiliares de ritmo.
 - Rechazo mínimo de ciclos: solo duración fuera del rango fisiológico configurado.
 
 Uso recomendado:
-    python 01_preprocesamiento_y_ciclos.py "archivo_filtrado.h5" --fps 30 --outdir salida_01_ciclos
+    python 01_preprocesamiento_y_ciclos_CORREGIDO_FASE.py "archivo_filtrado.h5" --fps 30 --outdir salida_01_ciclos
 
-Si la cámara está invertida o el inicio de ciclo queda en toe-off en vez de foot strike:
-    python 01_preprocesamiento_y_ciclos.py "archivo_filtrado.h5" --event-polarity min
+Para este montaje experimental, usar MIN como definición estandarizada del inicio del ciclo (foot-strike-like).
+Si cambia la orientación de la cámara o el lado corporal analizado, validar de nuevo el evento con el PNG de control.
 
 Opciones útiles:
     --event-method distal_x        método recomendado
@@ -73,7 +75,7 @@ RHYTHM_BODY_PARTS = ["ankle", "knee", "hip"]
 
 # Método recomendado para treadmill lateral: extremos de posición horizontal distal.
 EVENT_METHOD = "distal_x"      # distal_x, distal_y, velocity_x
-EVENT_POLARITY = "auto"        # auto, max, min
+EVENT_POLARITY = "min"         # CORREGIDO: min estandarizado para este montaje; auto queda disponible solo para diagnóstico
 
 # Con 30 FPS cada frame = 33,3 ms.
 # Mantener estos rangos amplios evita eliminar ciclos reales; ajustar si el gráfico lo exige.
@@ -894,7 +896,7 @@ def write_params(
 ) -> None:
     with open(params_file, "w", encoding="utf-8") as f:
         f.write("script = 01_preprocesamiento_y_ciclos.py\n")
-        f.write("version = distal_x_footstrike_v3\n")
+        f.write("version = distal_x_footstrike_v4_fixed_min_setup\n")
         f.write(f"input_file = {input_file}\n")
         f.write(f"fps = {fps}\n")
         f.write(f"likelihood_min = {likelihood_min}\n")
@@ -1066,7 +1068,7 @@ def run_pipeline(
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Primera parte: leer DLC, limpiar coordenadas, detectar ciclos con toe+foot distal_x y normalizar 0-100%."
+        description="Primera parte corregida: leer DLC, limpiar coordenadas, detectar ciclos toe+foot distal_x con MIN estandarizado y normalizar 0-100%."
     )
     parser.add_argument("input_file", type=str, help="Archivo .h5 o .csv de DeepLabCut.")
     parser.add_argument("--outdir", type=str, default="salida_01_ciclos", help="Carpeta de salida.")
@@ -1077,7 +1079,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--contact-bodyparts", type=str, default=",".join(CONTACT_BODY_PARTS), help="Puntos distales para detectar ciclos. Ej: toe,foot")
     parser.add_argument("--rhythm-bodyparts", type=str, default=",".join(RHYTHM_BODY_PARTS), help="Puntos auxiliares de ritmo para exportar. No definen contacto.")
     parser.add_argument("--event-method", type=str, default=EVENT_METHOD, choices=["distal_x", "distal_y", "velocity_x"], help="Método de detección.")
-    parser.add_argument("--event-polarity", type=str, default=EVENT_POLARITY, choices=["auto", "max", "min"], help="Extremo que define el inicio del ciclo.")
+    parser.add_argument("--event-polarity", type=str, default=EVENT_POLARITY, choices=["auto", "max", "min"], help="Extremo que define el inicio del ciclo. Default corregido: min para este montaje experimental. Use auto solo como diagnóstico y valide el PNG.")
     parser.add_argument("--min-cycle-s", type=float, default=MIN_CYCLE_DURATION_S, help="Duración mínima aceptada del ciclo en segundos.")
     parser.add_argument("--max-cycle-s", type=float, default=MAX_CYCLE_DURATION_S, help="Duración máxima aceptada del ciclo en segundos.")
     parser.add_argument("--prominence", type=float, default=None, help="Prominencia manual en pixeles. Si se omite, se calcula automático.")
