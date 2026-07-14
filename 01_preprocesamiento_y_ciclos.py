@@ -25,7 +25,7 @@ Versión corregida de fase:
 - Rechazo mínimo de ciclos: solo duración fuera del rango fisiológico configurado.
 
 Uso recomendado:
-    python 01_preprocesamiento_y_ciclos_CORREGIDO_FASE.py "archivo_filtrado.h5" --fps 30 --outdir salida_01_ciclos
+    python 01_preprocesamiento_y_ciclos_CORREGIDO_FASE.py "archivo_filtrado.h5" --fps 60 --outdir salida_01_ciclos
 
 Para este montaje experimental, usar MIN como definición estandarizada del inicio del ciclo (foot-strike-like).
 Si cambia la orientación de la cámara o el lado corporal analizado, validar de nuevo el evento con el PNG de control.
@@ -59,15 +59,15 @@ except Exception:
 # PARAMETROS EDITABLES
 # =============================================================================
 
-FPS = 30.0
+FPS = 60.0
 
 BODY_PARTS = ["crest", "hip", "knee", "ankle", "foot", "toe"]
 COORDS = ["x", "y", "likelihood"]
 
 # Tracking
 LIKELIHOOD_MIN = 0.80
-MAX_GAP_INTERPOLATION = 5
-SMOOTH_WINDOW = 5
+MAX_GAP_INTERPOLATION = 10
+SMOOTH_WINDOW = 11
 
 # Detección de ciclos
 CONTACT_BODY_PARTS = ["toe", "foot"]
@@ -77,7 +77,7 @@ RHYTHM_BODY_PARTS = ["ankle", "knee", "hip"]
 EVENT_METHOD = "distal_x"      # distal_x, distal_y, velocity_x
 EVENT_POLARITY = "min"         # CORREGIDO: min estandarizado para este montaje; auto queda disponible solo para diagnóstico
 
-# Con 30 FPS cada frame = 33,3 ms.
+# Con 60 FPS cada frame = 16,7 ms.
 # Mantener estos rangos amplios evita eliminar ciclos reales; ajustar si el gráfico lo exige.
 MIN_CYCLE_DURATION_S = 0.12
 MAX_CYCLE_DURATION_S = 1.50
@@ -88,7 +88,7 @@ MIN_PROMINENCE_PX = 2.0
 PROMINENCE_SD_FACTOR = 0.20
 
 # Para agrupar eventos de toe y foot que caen casi en el mismo frame.
-MERGE_TOLERANCE_FRAMES = 2
+MERGE_TOLERANCE_FRAMES = 4
 MIN_EVENT_SUPPORT = 1
 
 # Normalización 0-100 % del ciclo.
@@ -1072,7 +1072,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("input_file", type=str, help="Archivo .h5 o .csv de DeepLabCut.")
     parser.add_argument("--outdir", type=str, default="salida_01_ciclos", help="Carpeta de salida.")
-    parser.add_argument("--fps", type=float, default=FPS, help="Frames por segundo del video. Default: 30.")
+    parser.add_argument("--fps", type=float, default=FPS, help="Frames por segundo del video. Default: 60.")
     parser.add_argument("--likelihood-min", type=float, default=LIKELIHOOD_MIN, help="Umbral mínimo de likelihood.")
     parser.add_argument("--max-gap", type=int, default=MAX_GAP_INTERPOLATION, help="Gaps máximos a interpolar.")
     parser.add_argument("--smooth-window", type=int, default=SMOOTH_WINDOW, help="Ventana de suavizado; se fuerza impar.")
