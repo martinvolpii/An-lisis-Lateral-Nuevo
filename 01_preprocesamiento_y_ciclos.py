@@ -25,7 +25,7 @@ Versión corregida de fase:
 - Rechazo mínimo de ciclos: solo duración fuera del rango fisiológico configurado.
 
 Uso recomendado:
-    python 01_preprocesamiento_y_ciclos_CORREGIDO_FASE.py "archivo_filtrado.h5" --fps 60 --outdir salida_01_ciclos
+    python 01_preprocesamiento_y_ciclos.py "archivo_filtrado.h5" --fps 60 --outdir salida_01_ciclos
 
 Para este montaje experimental, usar MIN como definición estandarizada del inicio del ciclo (foot-strike-like).
 Si cambia la orientación de la cámara o el lado corporal analizado, validar de nuevo el evento con el PNG de control.
@@ -65,7 +65,7 @@ BODY_PARTS = ["crest", "hip", "knee", "ankle", "foot", "toe"]
 COORDS = ["x", "y", "likelihood"]
 
 # Tracking
-LIKELIHOOD_MIN = 0.80
+LIKELIHOOD_MIN = 0.70
 MAX_GAP_INTERPOLATION = 10
 SMOOTH_WINDOW = 11
 
