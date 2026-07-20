@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-02_goniometria_lateral_por_ciclos.py
+02_goniometria_lateral_por_ciclos_TOP10.py
 
 Segunda parte del pipeline para análisis de marcha murina con DeepLabCut.
 Este script SOLO hace goniometría lateral usando las salidas del script 01.
@@ -455,6 +455,118 @@ def calculate_angle_range_summary(ranges: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
+# SELECCION TOP-N POR ARTICULACION (SALIDA ADICIONAL; NO REEMPLAZA DATOS COMPLETOS)
+# =============================================================================
+
+def export_top_cycles_by_maximum(
+    profiles: pd.DataFrame,
+    ranges: pd.DataFrame,
+    outdir: Path,
+    stem: str,
+    top_n: int = 10,
+    show_plots: bool = False,
+) -> Dict[str, Path]:
+    """
+    Exporta una selección adicional de los N ciclos con mayor ángulo máximo
+    para cada articulación de forma independiente.
+
+    Esta selección NO modifica ni reemplaza las salidas completas.
+    No aplica estadística inferencial ni genera datos sintéticos.
+    """
+    top_n = max(1, int(top_n))
+    joint_labels = {"hip": "Cadera", "knee": "Rodilla", "ankle": "Tobillo", "foot": "Pie"}
+    colors = {"hip": "tab:blue", "knee": "tab:orange", "ankle": "tab:green", "foot": "tab:red"}
+
+    selected_rows = []
+    top_range_rows = []
+    top_profile_rows = []
+
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10), sharex=True)
+    axes = axes.ravel()
+
+    for ax, joint in zip(axes, ANGLE_NAMES):
+        max_col = f"{joint}_max_deg"
+        angle_col = f"{joint}_angle_deg"
+        if max_col not in ranges.columns or angle_col not in profiles.columns:
+            ax.set_visible(False)
+            continue
+
+        valid = ranges.dropna(subset=[max_col]).copy()
+        selected = valid.nlargest(min(top_n, len(valid)), max_col).copy()
+        selected = selected.sort_values(max_col, ascending=False).reset_index(drop=True)
+        selected["selection_rank"] = np.arange(1, len(selected) + 1)
+
+        for _, row in selected.iterrows():
+            cid = int(row["cycle_id"])
+            rank = int(row["selection_rank"])
+            selected_rows.append({
+                "joint": joint,
+                "joint_label": joint_labels[joint],
+                "selection_rank": rank,
+                "cycle_id": cid,
+                "max_angle_deg": float(row[max_col]),
+                "start_frame": row.get("start_frame", np.nan),
+                "end_frame": row.get("end_frame", np.nan),
+                "duration_frames": row.get("duration_frames", np.nan),
+                "duration_s": row.get("duration_s", np.nan),
+                "selection_rule": f"top_{top_n}_by_{max_col}",
+            })
+
+            rr = row.to_dict()
+            rr.update({"joint": joint, "joint_label": joint_labels[joint], "selection_rank": rank})
+            top_range_rows.append(rr)
+
+            pp = profiles[profiles["cycle_id"] == cid].copy()
+            pp.insert(0, "selection_rank", rank)
+            pp.insert(0, "joint_label", joint_labels[joint])
+            pp.insert(0, "joint", joint)
+            top_profile_rows.append(pp)
+
+            if not pp.empty:
+                ax.plot(pp["percent_gait_cycle"], pp[angle_col], color=colors[joint], alpha=0.22, linewidth=1.0)
+
+        # Perfil medio de los ciclos seleccionados para esta articulación.
+        ids = selected["cycle_id"].astype(int).tolist() if not selected.empty else []
+        subset = profiles[profiles["cycle_id"].isin(ids)]
+        if not subset.empty:
+            mean_prof = subset.groupby("percent_gait_cycle", as_index=False)[angle_col].mean()
+            ax.plot(mean_prof["percent_gait_cycle"], mean_prof[angle_col], color=colors[joint], linewidth=3.0, label=f"Promedio Top {len(ids)}")
+
+        ax.set_title(joint_labels[joint])
+        ax.set_ylabel("Ángulo (°)")
+        ax.grid(alpha=0.2)
+        ax.legend(loc="best")
+
+    axes[2].set_xlabel("Ciclo de marcha (%)")
+    axes[3].set_xlabel("Ciclo de marcha (%)")
+    fig.suptitle(f"Goniometría lateral — Top {top_n} ciclos por máximo angular")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+    selected_csv = outdir / f"{stem}_top{top_n}_selected_cycles.csv"
+    ranges_csv = outdir / f"{stem}_top{top_n}_cycle_angle_ranges.csv"
+    profiles_csv = outdir / f"{stem}_top{top_n}_cycle_angle_profiles.csv"
+    plot_png = outdir / f"{stem}_top{top_n}_angle_profiles.png"
+
+    pd.DataFrame(selected_rows).to_csv(selected_csv, index=False)
+    pd.DataFrame(top_range_rows).to_csv(ranges_csv, index=False)
+    if top_profile_rows:
+        pd.concat(top_profile_rows, ignore_index=True).to_csv(profiles_csv, index=False)
+    else:
+        pd.DataFrame().to_csv(profiles_csv, index=False)
+    fig.savefig(plot_png, dpi=220, bbox_inches="tight")
+    if show_plots:
+        plt.show()
+    plt.close(fig)
+
+    return {
+        "top_selected_cycles": selected_csv,
+        "top_cycle_angle_ranges": ranges_csv,
+        "top_cycle_angle_profiles": profiles_csv,
+        "top_angle_profiles_png": plot_png,
+    }
+
+
+# =============================================================================
 # GRAFICOS
 # =============================================================================
 
@@ -577,6 +689,7 @@ def run_pipeline(
     accepted_only: bool = ACCEPTED_ONLY,
     min_finite_fraction: float = MIN_FINITE_FRACTION_FOR_RANGE,
     show_plots: bool = SHOW_PLOTS,
+    top_n: int = 10,
 ) -> Dict[str, Path]:
     """Ejecuta la segunda parte completa del pipeline."""
     clean_file = Path(clean_file)
@@ -636,6 +749,10 @@ def run_pipeline(
     ranges.to_csv(ranges_csv, index=False)
     range_summary.to_csv(range_summary_csv, index=False)
 
+    top_outputs = export_top_cycles_by_maximum(
+        profiles=profiles, ranges=ranges, outdir=outdir, stem=stem, top_n=top_n, show_plots=show_plots
+    )
+
     plot_angle_profiles(profiles, profiles_png, show=show_plots)
     plot_angle_cycle_control(angles, cycles, control_png, show=show_plots)
 
@@ -675,6 +792,7 @@ def run_pipeline(
         "angle_profiles_png": profiles_png,
         "angle_cycle_control_png": control_png,
         "params": params_txt,
+        **top_outputs,
     }
 
 
@@ -724,6 +842,12 @@ def build_argparser() -> argparse.ArgumentParser:
         help="Fracción mínima de datos finitos para calcular rango angular. Default: 0.70.",
     )
     parser.add_argument(
+        "--top-n",
+        type=int,
+        default=10,
+        help="Salida adicional: N ciclos con mayor ángulo máximo por articulación. Default: 10.",
+    )
+    parser.add_argument(
         "--show-plots",
         action="store_true",
         help="Mostrar gráficos al terminar.",
@@ -745,6 +869,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             accepted_only=not args.all_cycles,
             min_finite_fraction=args.min_finite_fraction,
             show_plots=args.show_plots,
+            top_n=args.top_n,
         )
         return 0
     except Exception as exc:
