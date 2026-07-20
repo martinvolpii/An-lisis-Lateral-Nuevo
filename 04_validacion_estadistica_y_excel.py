@@ -4,7 +4,7 @@
 04_validacion_estadistica_y_excel.py
 
 Cuarta parte del pipeline para análisis cinemático lateral con DeepLabCut.
-Versión P30 para datos reales.
+Versión P30 para datos reales — corrección de auditoría Day 1.
 
 Principios de esta versión:
 - NO excluye animales por ID.
@@ -13,9 +13,11 @@ Principios de esta versión:
 - Respeta los criterios técnicos aplicados por los scripts 01, 02 y 03.
 - Conserva las banderas de control de calidad temporal (accepted_temporal,
   reject_reason) para auditoría.
-- Para estadística, una variable temporal solo se considera válida cuando
-  accepted_temporal == 1. Los valores originales se conservan además en
-  columnas *_raw para no perder información.
+- Para estadística, las variables que dependen de toe-off (stance/swing/toe clearance)
+  solo se consideran válidas cuando accepted_temporal == 1.
+- stride_duration_s se conserva para TODOS los ciclos validados porque depende solo de
+  start_frame/end_frame y no requiere toe-off.
+- Los valores originales se conservan además en columnas *_raw.
 - La unidad estadística principal es el animal, no el ciclo.
 
 Entradas esperadas, buscadas recursivamente dentro de --input-dir:
@@ -278,7 +280,9 @@ def read_one_dataset(stem: str, angle_path: Path, temporal_path: Optional[Path])
 
     Para las variables temporales:
       - se conserva el valor original en <variable>_raw;
-      - <variable> solo queda disponible para estadística si accepted_temporal == 1.
+      - stride_duration_s se conserva para todos los ciclos validados;
+      - stance/swing/toe clearance solo quedan disponibles para estadística si
+        accepted_temporal == 1.
     """
     angles = pd.read_csv(angle_path)
     animal_id = parse_animal_id(stem)
@@ -312,11 +316,18 @@ def read_one_dataset(stem: str, angle_path: Path, temporal_path: Optional[Path])
             accepted_mask = pd.Series(True, index=temporal.index)
 
         # Conservar valores originales y crear columnas de análisis que respetan QC.
+        # IMPORTANTE: stride_duration_s depende solo de los límites del ciclo ya
+        # validados por el script 01; NO depende de toe-off. Por ello se conserva
+        # para todos los ciclos, incluso si accepted_temporal == 0.
+        phase_dependent = {
+            "stance_duration_s", "swing_duration_s",
+            "stance_percent", "swing_percent", "toe_clearance_px",
+        }
         for var in TEMPORAL_VARIABLES:
             if var in temporal.columns:
                 raw = pd.to_numeric(temporal[var], errors="coerce")
                 temporal[f"{var}_raw"] = raw
-                temporal[var] = raw.where(accepted_mask, np.nan)
+                temporal[var] = raw.where(accepted_mask, np.nan) if var in phase_dependent else raw
             else:
                 temporal[var] = np.nan
                 temporal[f"{var}_raw"] = np.nan
@@ -585,7 +596,13 @@ def write_excel(out_path: Path, sheets: Dict[str, pd.DataFrame], metadata: Dict[
 # PROGRAMA PRINCIPAL
 # =============================================================================
 
-def build_validation_workbook(input_dir: Path, out_path: Path) -> Dict[str, pd.DataFrame]:
+def build_validation_workbook(
+    input_dir: Path,
+    out_path: Path,
+    treadmill_speed_cm_s: float = 20.0,
+    sex: str = "male",
+    litter_id: str = "P30_single_shared_litter",
+) -> Dict[str, pd.DataFrame]:
     all_cycles = load_all_datasets(input_dir)
     variables = [v for v in DEFAULT_VARIABLES if v in all_cycles.columns]
 
@@ -629,7 +646,19 @@ def build_validation_workbook(input_dir: Path, out_path: Path) -> Dict[str, pd.D
         "animal_exclusion": "NINGUNA_AUTOMATICA",
         "dataset_exclusion": "NINGUNA_AUTOMATICA",
         "dataset_deduplication": "DESACTIVADA_NO_EXISTE_EN_ESTA_VERSION",
-        "technical_qc": "Se respetan criterios de scripts 01-03; temporal solo entra a estadistica si accepted_temporal == 1",
+        "technical_qc": (
+            "stride_duration_s usa todos los ciclos validados; stance/swing/toe_clearance "
+            "solo usan ciclos con accepted_temporal == 1"
+        ),
+        "treadmill_speed_cm_s": treadmill_speed_cm_s,
+        "sex": sex,
+        "litter_id": litter_id,
+        "litter_model_note": (
+            "Todos los animales pertenecen a una sola camada. No es posible estimar "
+            "un efecto aleatorio de camada con un solo nivel; la inferencia se interpreta "
+            "condicionada a esta camada y requiere replicacion en camadas independientes "
+            "para generalizacion poblacional."
+        ),
         "raw_temporal_preserved": "SI_en_columnas_sufijo_raw",
         "variables": ", ".join(variables),
         "statistical_unit_main": "animal",
@@ -661,6 +690,12 @@ def make_argparser() -> argparse.ArgumentParser:
         default="validacion_estadistica_dlc.xlsx",
         help="Ruta del Excel de salida.",
     )
+    p.add_argument("--treadmill-speed-cm-s", type=float, default=20.0,
+                   help="Metadato experimental. P30 Day 1: 20 cm/s.")
+    p.add_argument("--sex", type=str, default="male",
+                   help="Metadato experimental. P30 Day 1: todos machos.")
+    p.add_argument("--litter-id", type=str, default="P30_single_shared_litter",
+                   help="Metadato experimental. P30 Day 1: una sola camada.")
     return p
 
 
@@ -669,6 +704,9 @@ def main() -> None:
     sheets = build_validation_workbook(
         input_dir=Path(args.input_dir),
         out_path=Path(args.out),
+        treadmill_speed_cm_s=args.treadmill_speed_cm_s,
+        sex=args.sex,
+        litter_id=args.litter_id,
     )
     print("Excel generado correctamente:", args.out)
     print("Hojas generadas:", ", ".join(sheets.keys()))
