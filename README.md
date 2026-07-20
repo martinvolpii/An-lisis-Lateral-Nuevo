@@ -54,12 +54,4 @@ independent litters.
    - Recomputes intra-animal variability using all valid stride cycles.
    - Explicitly documents that one litter cannot support a litter random effect.
 
-## Scientific interpretation
 
-The current code is suitable for an **exploratory Day 1 analysis**. Cycle segmentation is the
-most strongly validated component. Before publication-level claims about stance/swing or
-toe-clearance, independent validation of contact events is recommended. Absolute joint ROM and
-full angular curves should also be interpreted with the fixed 5-frame smoothing documented,
-because smoothing sensitivity was observed during audit.
-
-Do not tune parameters animal-by-animal or genotype-by-genotype.
