@@ -3,117 +3,87 @@
 """
 01_preprocesamiento_y_ciclos.py
 
-Primera parte del pipeline para análisis de marcha murina con DeepLabCut.
+Detector multiseñal de ciclos de marcha para el proyecto P30 (DeepLabCut, vista lateral).
 
-Este script SOLO hace:
-1. Leer archivo .h5 o .csv de DeepLabCut.
-2. Extraer crest, hip, knee, ankle, foot y toe.
-3. Filtrar coordenadas por likelihood.
-4. Interpolar gaps cortos.
-5. Suavizar coordenadas.
-6. Detectar ciclos de marcha.
-7. Normalizar cada ciclo aceptado a 0-100%.
-8. Exportar archivos de control.
+Versión validada visualmente en los 10 videos P30 el 2026-07-20.
 
-Versión corregida de fase:
-- Método principal: distal_x.
-- Usa toe + foot como señal distal combinada.
-- Detecta eventos por extremos de la posición horizontal distal y velocidad.
-- Para este montaje experimental/cámara, el foot strike se fija en el mínimo de distal_x.
-- Se evita usar auto como valor por defecto porque puede elegir el extremo opuesto y desfasar el 0% del ciclo.
-- hip/knee/ankle NO definen contacto; se exportan como señales auxiliares de ritmo.
-- Rechazo mínimo de ciclos: solo duración fuera del rango fisiológico configurado.
+Principio de detección
+---------------------
+1. Se filtran coordenadas por likelihood >= 0.70 y se interpolan solo gaps cortos.
+2. La señal primaria de evento es la posición horizontal del toe relativa a la cadera:
+       toe_x - hip_x
+3. Cada mínimo candidato del Toe se acepta por una de dos vías:
+   A) confirmación fuerte por un mínimo cercano del ángulo de rodilla hip-knee-ankle;
+   B) confirmación alternativa conjunta por un extremo de knee_x-hip_x Y un extremo
+      del ángulo de cadera crest-hip-knee.
+4. No se impone un número mínimo de ciclos y nunca se insertan ciclos sintéticos.
+5. Los ciclos se construyen exclusivamente entre eventos consecutivos detectados.
+6. Los intervalos anómalos se marcan para auditoría, no se corrigen automáticamente.
 
-Uso recomendado:
-    python 01_preprocesamiento_y_ciclos.py "archivo_filtrado.h5" --fps 60 --outdir salida_01_ciclos
+Decisiones metodológicas fijadas para P30
+-----------------------------------------
+- FPS experimental: 60 Hz.
+- LIKELIHOOD_MIN: 0.70.
+- Suavizado para detección: 5 frames.
+- Suavizado de coordenadas exportadas para goniometría/temporal: 5 frames.
+  La versión previa usaba 11 frames; se redujo porque varios ciclos reales duran
+  solo 5-8 frames y una ventana de 11 frames atenuaba fuertemente la cinemática.
+- Duración mínima de ciclo: 0.08 s (5 frames a 60 Hz), como límite de resolución,
+  no como objetivo de cadencia.
+- Duración máxima de ciclo: 1.50 s.
+- Normalización opcional del ciclo: 101 puntos (0-100%).
 
-Para este montaje experimental, usar MIN como definición estandarizada del inicio del ciclo (foot-strike-like).
-Si cambia la orientación de la cámara o el lado corporal analizado, validar de nuevo el evento con el PNG de control.
+Salidas compatibles con scripts 02 y 03
+----------------------------------------
+*_clean_coords.csv
+*_events_detected.csv
+*_gait_cycles.csv
+*_normalized_cycles.csv
+*_cycle_detection_signals.csv
+*_rejected_event_candidates.csv
+*_cycle_detection_check.png
+*_params.txt
 
-Opciones útiles:
-    --event-method distal_x        método recomendado
-    --event-polarity auto|max|min  auto intenta inferir foot strike
-    --prominence 3                 baja/sube sensibilidad
-    --contact-bodyparts toe,foot   puntos distales usados
+Uso:
+    python 01_preprocesamiento_y_ciclos.py archivo_DLC.h5 --outdir salida_01
+
+Este script mantiene el esquema de columnas requerido por los scripts 02 y 03.
 """
 
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
+import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 try:
     from scipy.signal import find_peaks, savgol_filter
-    SCIPY_AVAILABLE = True
-except Exception:
-    SCIPY_AVAILABLE = False
+except Exception as exc:  # pragma: no cover
+    raise RuntimeError("Este script requiere scipy (scipy.signal.find_peaks/savgol_filter).") from exc
 
-
-# =============================================================================
-# PARAMETROS EDITABLES
-# =============================================================================
+ALGORITHM_VERSION = "P30_multisignal_validated_v3_2026-07-20"
 
 FPS = 60.0
-
 BODY_PARTS = ["crest", "hip", "knee", "ankle", "foot", "toe"]
 COORDS = ["x", "y", "likelihood"]
 
-# Tracking
 LIKELIHOOD_MIN = 0.70
 MAX_GAP_INTERPOLATION = 10
-SMOOTH_WINDOW = 11
+ANALYSIS_SMOOTH_WINDOW = 5
+DETECTION_SMOOTH_WINDOW = 5
 
-# Detección de ciclos
-CONTACT_BODY_PARTS = ["toe", "foot"]
-RHYTHM_BODY_PARTS = ["ankle", "knee", "hip"]
-
-# Método recomendado para treadmill lateral: extremos de posición horizontal distal.
-EVENT_METHOD = "distal_x"      # distal_x, distal_y, velocity_x
-EVENT_POLARITY = "min"         # CORREGIDO: min estandarizado para este montaje; auto queda disponible solo para diagnóstico
-
-# Con 60 FPS cada frame = 16,7 ms.
-# Mantener estos rangos amplios evita eliminar ciclos reales; ajustar si el gráfico lo exige.
-MIN_CYCLE_DURATION_S = 0.12
+MIN_CYCLE_DURATION_S = 0.08
 MAX_CYCLE_DURATION_S = 1.50
-
-# Si None, se calcula automático con la variabilidad de la señal.
-DETECTION_PROMINENCE_PX = None
-MIN_PROMINENCE_PX = 2.0
-PROMINENCE_SD_FACTOR = 0.20
-
-# Para agrupar eventos de toe y foot que caen casi en el mismo frame.
-MERGE_TOLERANCE_FRAMES = 4
-MIN_EVENT_SUPPORT = 1
-
-# Normalización 0-100 % del ciclo.
 NORM_POINTS = 101
-
-# No rechazar por NaN/rango; solo reportar calidad.
-ACCEPT_ONLY_DURATION = True
-
-
-# =============================================================================
-# UTILIDADES GENERALES
-# =============================================================================
+DEFAULT_PROMINENCE_Z = 0.10
 
 def sanitize_stem(path: Path) -> str:
     """Genera un stem seguro para nombres de salida."""
     return path.stem.replace(" ", "_").replace(".", "_")
-
-
-def parse_bodypart_list(value: str | Sequence[str]) -> List[str]:
-    if isinstance(value, str):
-        parts = [x.strip() for x in value.split(",") if x.strip()]
-    else:
-        parts = [str(x).strip() for x in value if str(x).strip()]
-    return parts
-
 
 def ensure_odd_window(window: int) -> int:
     window = int(window)
@@ -123,31 +93,10 @@ def ensure_odd_window(window: int) -> int:
         window += 1
     return window
 
-
-def robust_zscore(x: np.ndarray) -> np.ndarray:
-    x = np.asarray(x, dtype=float)
-    med = np.nanmedian(x)
-    mad = np.nanmedian(np.abs(x - med))
-    if not np.isfinite(mad) or mad == 0:
-        sd = np.nanstd(x)
-        if not np.isfinite(sd) or sd == 0:
-            return np.zeros_like(x, dtype=float)
-        return (x - np.nanmean(x)) / sd
-    return 0.6745 * (x - med) / mad
-
-
 def fill_inside_nans(x: np.ndarray) -> np.ndarray:
     """Rellena NaN internos solo para operaciones de señal; no modifica los CSV limpios."""
     s = pd.Series(np.asarray(x, dtype=float))
     return s.interpolate(method="linear", limit_direction="both").to_numpy(dtype=float)
-
-
-def rolling_median(x: np.ndarray, window: int) -> np.ndarray:
-    window = ensure_odd_window(window)
-    if window <= 1:
-        return np.asarray(x, dtype=float)
-    return pd.Series(x).rolling(window=window, center=True, min_periods=1).median().to_numpy(dtype=float)
-
 
 def smooth_1d(x: np.ndarray, window: int) -> np.ndarray:
     """Suavizado conservador que tolera NaN."""
@@ -156,14 +105,13 @@ def smooth_1d(x: np.ndarray, window: int) -> np.ndarray:
     if window <= 1 or len(x) < 3:
         return x.copy()
     y = fill_inside_nans(x)
-    if SCIPY_AVAILABLE and len(y) >= window and window >= 5:
+    if len(y) >= window and window >= 5:
         try:
             poly = 2 if window >= 5 else 1
             return savgol_filter(y, window_length=window, polyorder=poly, mode="interp")
         except Exception:
             pass
     return pd.Series(y).rolling(window=window, center=True, min_periods=1).mean().to_numpy(dtype=float)
-
 
 def interpolate_short_gaps(series: pd.Series, max_gap: int) -> pd.Series:
     """
@@ -175,11 +123,6 @@ def interpolate_short_gaps(series: pd.Series, max_gap: int) -> pd.Series:
         limit_area="inside",
         limit_direction="both",
     )
-
-
-# =============================================================================
-# LECTURA DE DEEPLABCUT
-# =============================================================================
 
 def read_dlc_file(path: Path) -> pd.DataFrame:
     """Lee H5 o CSV de DeepLabCut y devuelve DataFrame original."""
@@ -195,7 +138,6 @@ def read_dlc_file(path: Path) -> pd.DataFrame:
         # Respaldo para CSV ya plano.
         return pd.read_csv(path, index_col=0)
     raise ValueError(f"Formato no soportado: {suffix}. Use .h5 o .csv")
-
 
 def flatten_dlc_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -263,11 +205,6 @@ def flatten_dlc_columns(df: pd.DataFrame) -> pd.DataFrame:
     out.index = pd.RangeIndex(start=0, stop=len(out), step=1, name="frame")
     return out
 
-
-# =============================================================================
-# LIMPIEZA DE COORDENADAS
-# =============================================================================
-
 def clean_coordinates(
     flat: pd.DataFrame,
     likelihood_min: float,
@@ -302,176 +239,85 @@ def clean_coordinates(
         ordered += [f"{bp}_x", f"{bp}_y", f"{bp}_likelihood"]
     return clean[ordered]
 
-
-# =============================================================================
-# DETECCION DE CICLOS
-# =============================================================================
-
-def make_distal_signal(
-    clean: pd.DataFrame,
-    bodyparts: List[str],
-    coord: str,
-    smooth_window: int,
-) -> Tuple[np.ndarray, pd.DataFrame]:
-    """
-    Crea señal distal combinada desde toe/foot.
-    Se promedia cada punto distal en pixeles, manteniendo la escala original.
-    """
-    signals = []
-    debug_cols: Dict[str, np.ndarray] = {}
-
-    for bp in bodyparts:
-        col = f"{bp}_{coord}"
-        if col not in clean.columns:
-            raise ValueError(f"No existe la columna {col}")
-        sig = clean[col].to_numpy(dtype=float)
-        sig_filled = fill_inside_nans(sig)
-        sig_smooth = smooth_1d(sig_filled, window=max(3, smooth_window))
-        signals.append(sig_smooth)
-        debug_cols[f"{bp}_{coord}"] = sig_smooth
-
-    if not signals:
-        raise ValueError("No hay bodyparts distales para construir la señal.")
-
-    stack = np.vstack(signals)
-    combined = np.nanmean(stack, axis=0)
-    combined = smooth_1d(combined, window=max(3, smooth_window))
-    debug_cols[f"distal_{coord}"] = combined
-
-    debug = pd.DataFrame(debug_cols, index=clean.index.copy())
-    debug.index.name = "frame"
-    return combined, debug
-
-
 def calculate_velocity(signal: np.ndarray, fps: float) -> np.ndarray:
     sig = fill_inside_nans(np.asarray(signal, dtype=float))
     if len(sig) < 3:
         return np.full_like(sig, np.nan, dtype=float)
     return np.gradient(sig) * float(fps)
 
+def internal_angle_from_clean(clean: pd.DataFrame, a: str, b: str, c: str) -> np.ndarray:
+    """Ángulo interno ABC en grados usando coordenadas limpias."""
+    ax = clean[f"{a}_x"].to_numpy(dtype=float)
+    ay = clean[f"{a}_y"].to_numpy(dtype=float)
+    bx = clean[f"{b}_x"].to_numpy(dtype=float)
+    by = clean[f"{b}_y"].to_numpy(dtype=float)
+    cx = clean[f"{c}_x"].to_numpy(dtype=float)
+    cy = clean[f"{c}_y"].to_numpy(dtype=float)
 
-def auto_prominence(signal: np.ndarray) -> float:
-    sig = np.asarray(signal, dtype=float)
-    spread = np.nanpercentile(sig, 95) - np.nanpercentile(sig, 5)
-    sd = np.nanstd(sig)
-    val = max(MIN_PROMINENCE_PX, float(PROMINENCE_SD_FACTOR * sd), float(0.08 * spread))
-    if not np.isfinite(val) or val <= 0:
-        val = MIN_PROMINENCE_PX
-    return float(val)
+    v1x, v1y = ax - bx, ay - by
+    v2x, v2y = cx - bx, cy - by
+    dot = v1x * v2x + v1y * v2y
+    den = np.hypot(v1x, v1y) * np.hypot(v2x, v2y)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        cosang = np.clip(dot / den, -1.0, 1.0)
+        ang = np.degrees(np.arccos(cosang))
+    ang[(~np.isfinite(den)) | (den <= 0)] = np.nan
+    return ang
 
+def detrend_and_standardize_signal(signal: np.ndarray, fps: float) -> np.ndarray:
+    """
+    Elimina deriva lenta y estandariza de forma robusta.
 
-def estimate_period_autocorr(signal: np.ndarray, fps: float, min_cycle_s: float, max_cycle_s: float) -> Optional[float]:
-    """Estima periodo dominante en frames usando autocorrelación."""
+    La deriva se estima con mediana móvil de ~1 s. Después se aplica un suavizado
+    corto (~0.06 s), para no borrar ciclos rápidos en videos de 30-60 fps.
+    """
     x = fill_inside_nans(np.asarray(signal, dtype=float))
-    if len(x) < 10:
-        return None
-    z = robust_zscore(x)
-    z = z - np.nanmean(z)
-    z[~np.isfinite(z)] = 0.0
+    if len(x) < 3:
+        return np.asarray(x, dtype=float)
 
-    min_lag = max(2, int(round(min_cycle_s * fps)))
-    max_lag = min(len(z) // 2, int(round(max_cycle_s * fps)))
-    if max_lag <= min_lag:
-        return None
+    baseline_window = ensure_odd_window(max(5, int(round(float(fps) * 1.0))))
+    baseline = pd.Series(x).rolling(
+        window=baseline_window, center=True, min_periods=1
+    ).median().to_numpy(dtype=float)
+    y = x - baseline
 
-    ac = np.correlate(z, z, mode="full")
-    ac = ac[len(ac) // 2:]
-    segment = ac[min_lag:max_lag + 1]
-    if len(segment) == 0 or not np.isfinite(segment).any():
-        return None
-    lag = int(np.nanargmax(segment) + min_lag)
-    if min_lag <= lag <= max_lag:
-        return float(lag)
-    return None
+    short_window = ensure_odd_window(max(3, int(round(float(fps) * 0.06))))
+    if len(y) >= short_window and short_window >= 5:
+        try:
+            y = savgol_filter(y, window_length=short_window, polyorder=2, mode="interp")
+        except Exception:
+            pass
+    elif short_window > 1:
+        y = pd.Series(y).rolling(
+            window=short_window, center=True, min_periods=1
+        ).mean().to_numpy(dtype=float)
 
+    med = float(np.nanmedian(y))
+    mad = float(np.nanmedian(np.abs(y - med)))
+    scale = 1.4826 * mad
+    if not np.isfinite(scale) or scale <= 1e-12:
+        scale = float(np.nanstd(y))
+    if not np.isfinite(scale) or scale <= 1e-12:
+        scale = 1.0
+    return (y - med) / scale
 
-def find_extrema_events(
-    signal: np.ndarray,
-    fps: float,
-    min_cycle_s: float,
-    max_cycle_s: float,
-    prominence: float,
+def _find_extrema_z(
+    z: np.ndarray,
     polarity: str,
-    expected_period: Optional[float],
+    distance_frames: int,
+    prominence_z: float,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Detecta máximos o mínimos locales de la señal."""
-    if not SCIPY_AVAILABLE:
-        raise RuntimeError("Este script requiere scipy para detección robusta de ciclos. Instala scipy o ejecuta en entorno con scipy.")
-
-    sig = fill_inside_nans(np.asarray(signal, dtype=float))
-    min_frames = max(1, int(round(min_cycle_s * fps)))
-    if expected_period is not None and np.isfinite(expected_period):
-        # Separación entre eventos del mismo tipo. 0.55 evita duplicados y tolera variación real.
-        distance = max(min_frames, int(round(0.55 * expected_period)))
-    else:
-        distance = min_frames
-
-    work = sig if polarity == "max" else -sig
-    peaks, props = find_peaks(work, distance=distance, prominence=prominence)
+    """Extremos en una señal estandarizada robustamente."""
+    work = np.asarray(z, dtype=float) if polarity == "max" else -np.asarray(z, dtype=float)
+    peaks, props = find_peaks(
+        work,
+        distance=max(1, int(distance_frames)),
+        prominence=max(0.0, float(prominence_z)),
+    )
     proms = props.get("prominences", np.full(len(peaks), np.nan, dtype=float))
     return peaks.astype(int), np.asarray(proms, dtype=float)
 
-
-def interval_quality(frames: np.ndarray, fps: float, min_cycle_s: float, max_cycle_s: float) -> Dict[str, float]:
-    """Métrica simple para comparar trenes de eventos."""
-    frames = np.asarray(frames, dtype=int)
-    if len(frames) < 3:
-        return {"n": float(len(frames)), "valid_n": 0.0, "median_interval": np.nan, "cv": np.inf, "score": -np.inf}
-    intervals = np.diff(frames).astype(float)
-    min_f = max(1, int(round(min_cycle_s * fps)))
-    max_f = max(min_f + 1, int(round(max_cycle_s * fps)))
-    valid = intervals[(intervals >= min_f) & (intervals <= max_f)]
-    if len(valid) < 2:
-        return {"n": float(len(frames)), "valid_n": float(len(valid)), "median_interval": np.nan, "cv": np.inf, "score": -np.inf}
-    med = float(np.nanmedian(valid))
-    cv = float(np.nanstd(valid, ddof=1) / med) if med > 0 and len(valid) > 1 else np.inf
-    score = float(len(valid) - 2.0 * cv)
-    return {"n": float(len(frames)), "valid_n": float(len(valid)), "median_interval": med, "cv": cv, "score": score}
-
-
-def infer_foot_strike_polarity_from_halves(
-    signal: np.ndarray,
-    max_frames: np.ndarray,
-    min_frames: np.ndarray,
-) -> Optional[str]:
-    """
-    Intenta inferir si el foot strike corresponde a máximo o mínimo.
-    En treadmill lateral, swing suele ser más corto y rápido que stance.
-    Si min->max es más corto que max->min, el extremo final de swing es max.
-    Si max->min es más corto, el extremo final de swing es min.
-    """
-    max_frames = np.asarray(max_frames, dtype=int)
-    min_frames = np.asarray(min_frames, dtype=int)
-    if len(max_frames) < 2 or len(min_frames) < 2:
-        return None
-
-    min_to_next_max = []
-    max_to_next_min = []
-
-    for mn in min_frames:
-        after = max_frames[max_frames > mn]
-        if len(after):
-            min_to_next_max.append(int(after[0] - mn))
-    for mx in max_frames:
-        after = min_frames[min_frames > mx]
-        if len(after):
-            max_to_next_min.append(int(after[0] - mx))
-
-    if len(min_to_next_max) < 2 or len(max_to_next_min) < 2:
-        return None
-
-    a = float(np.nanmedian(min_to_next_max))
-    b = float(np.nanmedian(max_to_next_min))
-    if not np.isfinite(a) or not np.isfinite(b):
-        return None
-
-    # Exigir diferencia mínima para no forzar una inferencia dudosa.
-    if abs(a - b) < 1.0:
-        return None
-    return "max" if a < b else "min"
-
-
-def detect_distal_x_events(
+def detect_multisignal_events(
     clean: pd.DataFrame,
     contact_bodyparts: List[str],
     rhythm_bodyparts: List[str],
@@ -486,173 +332,187 @@ def detect_distal_x_events(
     smooth_window: int,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, np.ndarray, float, Optional[float], str]:
     """
-    Detecta eventos de marcha usando señal distal combinada.
-    Por defecto, distal_x: extremos horizontales de toe+foot.
+    Detector multiseñal P30 V2.
+
+    Cada evento debe existir primero como mínimo de Toe X relativo al Hip.
+    Un mínimo del ángulo de rodilla hip-knee-ankle es confirmación fuerte.
+    Si el ángulo de rodilla no confirma, se exige simultáneamente soporte de
+    Knee X relativo al Hip y del ángulo de cadera crest-hip-knee.
+
+    No se crean eventos para rellenar huecos y no se fuerza ningún número de ciclos.
     """
-    contact_bodyparts = parse_bodypart_list(contact_bodyparts)
-    rhythm_bodyparts = parse_bodypart_list(rhythm_bodyparts)
+    if fps <= 0:
+        raise ValueError("fps debe ser > 0")
 
-    for bp in contact_bodyparts + rhythm_bodyparts:
-        if bp not in BODY_PARTS:
-            raise ValueError(f"Bodypart no reconocido: {bp}. Opciones: {BODY_PARTS}")
+    required = [
+        "toe_x", "hip_x", "knee_x",
+        "crest_x", "crest_y", "hip_y", "knee_y",
+        "ankle_x", "ankle_y",
+    ]
+    missing = [c for c in required if c not in clean.columns]
+    if missing:
+        raise ValueError("Faltan columnas para detección multiseñal V2: " + ", ".join(missing))
 
-    if event_method == "distal_x":
-        coord = "x"
-        base_signal, debug = make_distal_signal(clean, contact_bodyparts, coord="x", smooth_window=smooth_window)
-        event_signal = base_signal
-    elif event_method == "distal_y":
-        coord = "y"
-        base_signal, debug = make_distal_signal(clean, contact_bodyparts, coord="y", smooth_window=smooth_window)
-        event_signal = base_signal
-    elif event_method == "velocity_x":
-        coord = "x"
-        base_signal, debug = make_distal_signal(clean, contact_bodyparts, coord="x", smooth_window=smooth_window)
-        vx = calculate_velocity(base_signal, fps=fps)
-        # Eventos por picos de desaceleración/cambio de velocidad. Menos recomendado que distal_x.
-        event_signal = -np.abs(smooth_1d(vx, window=max(3, smooth_window)))
-        debug["distal_vx_px_s"] = vx
-        debug["velocity_event_signal"] = event_signal
-    else:
-        raise ValueError("event_method debe ser distal_x, distal_y o velocity_x")
+    toe_rel_x = clean["toe_x"].to_numpy(dtype=float) - clean["hip_x"].to_numpy(dtype=float)
+    knee_rel_x = clean["knee_x"].to_numpy(dtype=float) - clean["hip_x"].to_numpy(dtype=float)
+    hip_angle = internal_angle_from_clean(clean, "crest", "hip", "knee")
+    knee_angle = internal_angle_from_clean(clean, "hip", "knee", "ankle")
 
-    # Señales auxiliares para inspección, no para definir contactos.
-    for bp in rhythm_bodyparts:
-        for c in ["x", "y"]:
-            col = f"{bp}_{c}"
-            if col in clean.columns:
-                debug[f"rhythm_{bp}_{c}"] = smooth_1d(fill_inside_nans(clean[col].to_numpy(dtype=float)), window=max(3, smooth_window))
+    toe_z = detrend_and_standardize_signal(toe_rel_x, fps=fps)
+    knee_rel_z = detrend_and_standardize_signal(knee_rel_x, fps=fps)
+    hip_angle_z = detrend_and_standardize_signal(hip_angle, fps=fps)
+    knee_angle_z = detrend_and_standardize_signal(knee_angle, fps=fps)
 
-    if "distal_vx_px_s" not in debug.columns:
-        debug["distal_vx_px_s"] = calculate_velocity(base_signal, fps=fps)
-    debug["event_signal"] = event_signal
+    selected_polarity = "min" if event_polarity in {"min", "auto"} else event_polarity
+    if selected_polarity != "min":
+        raise ValueError("La versión multiseñal P30 V2 está estandarizada a event_polarity='min'.")
 
-    expected_period = estimate_period_autocorr(event_signal, fps=fps, min_cycle_s=min_cycle_s, max_cycle_s=max_cycle_s)
-    prominence = auto_prominence(event_signal) if prominence_px is None else float(prominence_px)
+    # Cinco frames = 83 ms a 60 Hz. Es un límite de resolución, no una cadencia objetivo.
+    min_distance_frames = max(5, int(round(float(min_cycle_s) * float(fps))))
+    toe_prominence_z = 0.10 if prominence_px is None else float(prominence_px)
+    secondary_prominence_z = max(0.10, toe_prominence_z)
 
-    # Detectar máximos y mínimos. Si auto, elegir por heurística de swing corto; si falla, calidad de intervalos.
-    max_events, max_prom = find_extrema_events(
-        event_signal, fps=fps, min_cycle_s=min_cycle_s, max_cycle_s=max_cycle_s,
-        prominence=prominence, polarity="max", expected_period=expected_period,
-    )
-    min_events, min_prom = find_extrema_events(
-        event_signal, fps=fps, min_cycle_s=min_cycle_s, max_cycle_s=max_cycle_s,
-        prominence=prominence, polarity="min", expected_period=expected_period,
+    toe_candidates, toe_prom = _find_extrema_z(
+        toe_z, polarity="min",
+        distance_frames=min_distance_frames,
+        prominence_z=toe_prominence_z,
     )
 
-    selected_polarity = event_polarity
-    if event_polarity == "auto":
-        inferred = infer_foot_strike_polarity_from_halves(event_signal, max_events, min_events)
-        if inferred is not None:
-            selected_polarity = inferred
+    secondary_distance = max(4, min_distance_frames)
+    knee_angle_min, _ = _find_extrema_z(
+        knee_angle_z, "min", secondary_distance, secondary_prominence_z
+    )
+    knee_rel_min, _ = _find_extrema_z(
+        knee_rel_z, "min", secondary_distance, secondary_prominence_z
+    )
+    knee_rel_max, _ = _find_extrema_z(
+        knee_rel_z, "max", secondary_distance, secondary_prominence_z
+    )
+    hip_min, _ = _find_extrema_z(
+        hip_angle_z, "min", secondary_distance, secondary_prominence_z
+    )
+    hip_max, _ = _find_extrema_z(
+        hip_angle_z, "max", secondary_distance, secondary_prominence_z
+    )
+    knee_rel_extrema = np.sort(np.unique(np.concatenate([knee_rel_min, knee_rel_max])))
+    hip_extrema = np.sort(np.unique(np.concatenate([hip_min, hip_max])))
+
+    # ±3 frames = ±50 ms.
+    tolerance = max(1, int(round(0.05 * float(fps))))
+
+    def nearest_delta(frames: np.ndarray, frame: int) -> int:
+        if len(frames) == 0:
+            return 10**9
+        return int(np.min(np.abs(frames - int(frame))))
+
+    rows = []
+    rejected_rows = []
+    for frame, prom in zip(toe_candidates, toe_prom):
+        frame = int(frame)
+        knee_angle_delta = nearest_delta(knee_angle_min, frame)
+        knee_rel_delta = nearest_delta(knee_rel_extrema, frame)
+        hip_delta = nearest_delta(hip_extrema, frame)
+
+        knee_angle_ok = knee_angle_delta <= tolerance
+        knee_rel_ok = knee_rel_delta <= tolerance
+        hip_ok = hip_delta <= tolerance
+
+        # A) Toe + mínimo del ángulo de rodilla.
+        # B) Toe + Knee relativo + ángulo de cadera.
+        accepted = bool(knee_angle_ok or (knee_rel_ok and hip_ok))
+
+        support_count = 1 + int(knee_angle_ok) + int(knee_rel_ok) + int(hip_ok)
+        if knee_angle_ok:
+            confidence_tier = "A_toe+knee_angle"
+        elif knee_rel_ok and hip_ok:
+            confidence_tier = "B_toe+knee_rel+hip_angle"
         else:
-            qmax = interval_quality(max_events, fps, min_cycle_s, max_cycle_s)
-            qmin = interval_quality(min_events, fps, min_cycle_s, max_cycle_s)
-            selected_polarity = "max" if qmax["score"] >= qmin["score"] else "min"
+            confidence_tier = "REJECT_no_secondary_consensus"
 
-    if selected_polarity == "max":
-        selected_events = max_events
-        selected_prom = max_prom
-    elif selected_polarity == "min":
-        selected_events = min_events
-        selected_prom = min_prom
-    else:
-        raise ValueError("event_polarity debe ser auto, max o min")
+        row = {
+            "frame": frame,
+            "support_count": support_count,
+            "confidence_tier": confidence_tier,
+            "toe_prominence_z": float(prom) if np.isfinite(prom) else np.nan,
+            "knee_angle_delta_frames": knee_angle_delta if knee_angle_delta < 10**8 else np.nan,
+            "knee_rel_delta_frames": knee_rel_delta if knee_rel_delta < 10**8 else np.nan,
+            "hip_angle_delta_frames": hip_delta if hip_delta < 10**8 else np.nan,
+            "knee_angle_support": int(knee_angle_ok),
+            "knee_rel_support": int(knee_rel_ok),
+            "hip_angle_support": int(hip_ok),
+            "event_signal_value": float(toe_z[frame]),
+        }
+        if accepted:
+            rows.append(row)
+        else:
+            rejected_rows.append(row)
 
-    # Calcular soporte por toe/foot individuales del mismo tipo.
-    support_rows = []
-    for frame, prom in zip(selected_events, selected_prom):
-        sources = ["distal_combined"]
-        source_frames = [int(frame)]
-        for bp in contact_bodyparts:
-            col = f"{bp}_{coord}"
-            if col not in clean.columns:
-                continue
-            sig_bp = smooth_1d(fill_inside_nans(clean[col].to_numpy(dtype=float)), window=max(3, smooth_window))
-            bp_events, _ = find_extrema_events(
-                sig_bp, fps=fps, min_cycle_s=min_cycle_s, max_cycle_s=max_cycle_s,
-                prominence=max(MIN_PROMINENCE_PX, prominence * 0.60),
-                polarity=selected_polarity, expected_period=expected_period,
-            )
-            close = bp_events[np.abs(bp_events - int(frame)) <= int(merge_tolerance_frames)]
-            if len(close):
-                sources.append(f"{bp}_{coord}")
-                source_frames.append(int(close[np.argmin(np.abs(close - int(frame)))]))
-
-        support_count = len(set(sources))
-        if support_count < int(min_event_support):
-            continue
-
-        support_rows.append({
-            "frame": int(frame),
-            "support_count": int(support_count),
-            "sources": ";".join(sorted(set(sources))),
-            "source_frames": ";".join(map(str, sorted(set(source_frames)))),
-            "mean_prominence": float(prom) if np.isfinite(prom) else np.nan,
-            "event_signal_value": float(event_signal[int(frame)]),
-        })
-
-    events = pd.DataFrame(support_rows).sort_values("frame").reset_index(drop=True)
-
-    # Limpieza conservadora de duplicados por si quedaron eventos demasiado cercanos.
-    min_frames = max(1, int(round(min_cycle_s * fps)))
-    if not events.empty and len(events) > 1:
-        rows = events.to_dict("records")
-        cleaned = []
-        for row in rows:
-            if not cleaned:
-                cleaned.append(row)
-                continue
-            gap = int(row["frame"]) - int(cleaned[-1]["frame"])
-            if gap < min_frames:
-                prev = cleaned[-1]
-                score_prev = (int(prev.get("support_count", 1)), float(prev.get("mean_prominence", 0) or 0), abs(float(prev.get("event_signal_value", 0) or 0)))
-                score_new = (int(row.get("support_count", 1)), float(row.get("mean_prominence", 0) or 0), abs(float(row.get("event_signal_value", 0) or 0)))
-                if score_new > score_prev:
-                    cleaned[-1] = row
-            else:
-                cleaned.append(row)
-        events = pd.DataFrame(cleaned).sort_values("frame").reset_index(drop=True)
-
+    events = pd.DataFrame(rows)
     if not events.empty:
-        intervals = np.diff(events["frame"].to_numpy(dtype=int)).astype(float)
-        period_from_events = float(np.nanmedian(intervals)) if len(intervals) else np.nan
-        if np.isfinite(period_from_events):
-            expected_period = period_from_events
+        events = events.sort_values("frame").reset_index(drop=True)
+        frames = events["frame"].to_numpy(dtype=int)
+        intervals = np.diff(frames).astype(float)
+        expected_period = float(np.nanmedian(intervals)) if len(intervals) else np.nan
+
+        prev_interval = np.r_[np.nan, intervals]
+        next_interval = np.r_[intervals, np.nan]
+        events["interval_from_prev_frames"] = prev_interval
+        events["interval_to_next_frames"] = next_interval
+
+        if np.isfinite(expected_period) and expected_period > 0:
+            events["review_long_interval_after"] = (
+                pd.Series(next_interval).gt(1.60 * expected_period).fillna(False).astype(int)
+            )
+            events["review_short_interval_after"] = (
+                pd.Series(next_interval).lt(0.65 * expected_period).fillna(False).astype(int)
+            )
+        else:
+            events["review_long_interval_after"] = 0
+            events["review_short_interval_after"] = 0
 
         events.insert(0, "event_id", np.arange(1, len(events) + 1, dtype=int))
-        events["time_s"] = events["frame"] / float(fps)
-        events["event_method"] = event_method
-        events["event_coord"] = coord
-        events["event_polarity"] = selected_polarity
-        events["contact_bodyparts"] = ",".join(contact_bodyparts)
-        events["rhythm_bodyparts_aux"] = ",".join(rhythm_bodyparts)
-        events["prominence_used_px"] = prominence
-        events["expected_period_frames"] = expected_period if expected_period is not None else np.nan
-        events["expected_period_s"] = (expected_period / fps) if expected_period is not None and np.isfinite(expected_period) else np.nan
+        events["time_s_60Hz"] = events["frame"] / float(fps)
+        events["event_method"] = "multisignal_v2_toe_kneeangle_flexible"
+        events["event_coord"] = "toe_x-hip_x + knee_angle + knee_x-hip_x + hip_angle"
+        events["event_polarity"] = "min"
+        events["support_tolerance_frames"] = tolerance
+        events["expected_period_frames"] = expected_period
+        events["expected_period_s_60Hz"] = expected_period / float(fps) if np.isfinite(expected_period) else np.nan
+    else:
+        expected_period = None
 
-        ordered = [
-            "event_id", "frame", "time_s", "support_count", "sources", "source_frames",
-            "mean_prominence", "event_signal_value", "event_method", "event_coord", "event_polarity",
-            "contact_bodyparts", "rhythm_bodyparts_aux", "prominence_used_px",
-            "expected_period_frames", "expected_period_s",
-        ]
-        events = events[[c for c in ordered if c in events.columns]]
+    debug = pd.DataFrame(index=clean.index.copy())
+    debug.index.name = "frame"
+    debug["toe_rel_x"] = toe_rel_x
+    debug["knee_rel_x"] = knee_rel_x
+    debug["hip_angle_deg"] = hip_angle
+    debug["knee_angle_deg"] = knee_angle
+    debug["toe_rel_x_z"] = toe_z
+    debug["knee_rel_x_z"] = knee_rel_z
+    debug["hip_angle_z"] = hip_angle_z
+    debug["knee_angle_z"] = knee_angle_z
+    debug["distal_x"] = toe_rel_x
+    debug["event_signal"] = toe_z
+    debug["distal_vx_px_s"] = calculate_velocity(toe_rel_x, fps=fps)
 
-    # Guardar candidatos máximos/mínimos en debug para revisar.
-    debug["candidate_max_event"] = 0
-    debug.loc[debug.index.intersection(max_events), "candidate_max_event"] = 1
-    debug["candidate_min_event"] = 0
-    debug.loc[debug.index.intersection(min_events), "candidate_min_event"] = 1
-    debug["selected_event"] = 0
+    for col in [
+        "candidate_toe_min", "candidate_knee_angle_min",
+        "candidate_knee_rel_extremum", "candidate_hip_angle_extremum",
+        "selected_event",
+    ]:
+        debug[col] = 0
+    debug.loc[debug.index.intersection(toe_candidates), "candidate_toe_min"] = 1
+    debug.loc[debug.index.intersection(knee_angle_min), "candidate_knee_angle_min"] = 1
+    debug.loc[debug.index.intersection(knee_rel_extrema), "candidate_knee_rel_extremum"] = 1
+    debug.loc[debug.index.intersection(hip_extrema), "candidate_hip_angle_extremum"] = 1
     if not events.empty:
         debug.loc[debug.index.intersection(events["frame"].to_numpy(dtype=int)), "selected_event"] = 1
 
-    return events, debug, event_signal, prominence, expected_period, selected_polarity
+    debug["candidate_min_event"] = debug["candidate_toe_min"]
+    debug["candidate_max_event"] = 0
+    debug.attrs["rejected_candidates"] = rejected_rows
 
-
-# =============================================================================
-# CONSTRUCCION Y NORMALIZACION DE CICLOS
-# =============================================================================
+    return events, debug, toe_z, toe_prominence_z, expected_period, "min"
 
 def build_cycles_from_events(
     events: pd.DataFrame,
@@ -735,7 +595,6 @@ def build_cycles_from_events(
 
     return pd.DataFrame(rows, columns=columns)
 
-
 def normalize_cycles(clean: pd.DataFrame, cycles: pd.DataFrame, n_points: int = 101, accepted_only: bool = True) -> pd.DataFrame:
     """Normaliza coordenadas limpias a 0-100 % para cada ciclo."""
     if cycles.empty:
@@ -781,11 +640,6 @@ def normalize_cycles(clean: pd.DataFrame, cycles: pd.DataFrame, n_points: int = 
         return pd.DataFrame()
     return pd.concat(rows, ignore_index=True)
 
-
-# =============================================================================
-# GRAFICOS Y EXPORTACION
-# =============================================================================
-
 def plot_cycle_detection_check(
     clean: pd.DataFrame,
     events: pd.DataFrame,
@@ -805,33 +659,34 @@ def plot_cycle_detection_check(
     # 1) distal x/y y eventos.
     ax = axes[0]
     if "distal_x" in debug.columns:
-        ax.plot(t, debug["distal_x"], linewidth=1.2, label="distal_x toe+foot")
+        ax.plot(t, debug["distal_x"], linewidth=1.2, label="Toe X relativo a Hip")
     if "distal_y" in debug.columns:
-        ax.plot(t, debug["distal_y"], linewidth=1.0, alpha=0.75, label="distal_y toe+foot")
+        ax.plot(t, debug["distal_y"], linewidth=1.0, alpha=0.75, label="distal_y")
     if not events.empty:
         ev_t = events["frame"].to_numpy(dtype=int) / float(fps)
         y = debug.loc[events["frame"].to_numpy(dtype=int), "distal_x"].to_numpy(dtype=float) if "distal_x" in debug.columns else debug.loc[events["frame"].to_numpy(dtype=int), "event_signal"].to_numpy(dtype=float)
         ax.scatter(ev_t, y, s=28, marker="o", label="eventos aceptados")
-    ax.set_ylabel("posición distal (px)")
-    ax.set_title(f"Detección de ciclos: {event_method}, polaridad={selected_polarity}")
+    ax.set_ylabel("Toe X - Hip X (px)")
+    ax.set_title("Detección multiseñal validada: Toe + ángulo de rodilla + respaldo Knee/cadera (60 Hz)")
     ax.legend(loc="best")
 
-    # 2) señal de evento con candidatos.
+    # 2) consenso de las tres señales estandarizadas.
     ax = axes[1]
-    ax.plot(t, debug["event_signal"], linewidth=1.2, label="event_signal")
-    if "candidate_max_event" in debug.columns:
-        idx = debug.index[debug["candidate_max_event"] == 1].to_numpy(dtype=int)
-        if len(idx):
-            ax.scatter(idx / float(fps), debug.loc[idx, "event_signal"], s=18, marker="^", label="candidatos max")
+    if "toe_rel_x_z" in debug.columns:
+        ax.plot(t, debug["toe_rel_x_z"], linewidth=1.2, label="Toe rel. X (z)")
+    if "knee_rel_x_z" in debug.columns:
+        ax.plot(t, debug["knee_rel_x_z"], linewidth=1.0, alpha=0.80, label="Knee rel. X (z)")
+    if "hip_angle_z" in debug.columns:
+        ax.plot(t, debug["hip_angle_z"], linewidth=1.0, alpha=0.75, label="Ángulo cadera (z)")
     if "candidate_min_event" in debug.columns:
         idx = debug.index[debug["candidate_min_event"] == 1].to_numpy(dtype=int)
         if len(idx):
-            ax.scatter(idx / float(fps), debug.loc[idx, "event_signal"], s=18, marker="v", label="candidatos min")
+            ax.scatter(idx / float(fps), debug.loc[idx, "toe_rel_x_z"], s=18, marker="v", label="candidatos Toe")
     if not events.empty:
         idx = events["frame"].to_numpy(dtype=int)
-        ax.scatter(idx / float(fps), debug.loc[idx, "event_signal"], s=32, marker="o", label="seleccionados")
-    ax.set_ylabel("señal evento")
-    ax.legend(loc="best")
+        ax.scatter(idx / float(fps), debug.loc[idx, "toe_rel_x_z"], s=34, marker="o", label="eventos multiseñal validados")
+    ax.set_ylabel("señales robustas (z)")
+    ax.legend(loc="best", ncol=2)
 
     # 3) velocidad horizontal distal.
     ax = axes[2]
@@ -873,55 +728,48 @@ def plot_cycle_detection_check(
     fig.savefig(out_png, dpi=180, bbox_inches="tight")
     plt.close(fig)
 
-
 def write_params(
     params_file: Path,
     input_file: Path,
     fps: float,
     likelihood_min: float,
     max_gap: int,
-    smooth_window: int,
-    contact_bodyparts: List[str],
-    rhythm_bodyparts: List[str],
-    event_method: str,
-    event_polarity: str,
-    selected_polarity: str,
+    analysis_smooth_window: int,
+    detection_smooth_window: int,
     min_cycle_s: float,
     max_cycle_s: float,
-    prominence: float,
+    prominence_z: float,
     expected_period: Optional[float],
     n_events: int,
     n_cycles: int,
     n_accepted: int,
 ) -> None:
-    with open(params_file, "w", encoding="utf-8") as f:
-        f.write("script = 01_preprocesamiento_y_ciclos.py\n")
-        f.write("version = distal_x_footstrike_v4_fixed_min_setup\n")
-        f.write(f"input_file = {input_file}\n")
-        f.write(f"fps = {fps}\n")
-        f.write(f"likelihood_min = {likelihood_min}\n")
-        f.write(f"max_gap_interpolation = {max_gap}\n")
-        f.write(f"smooth_window = {smooth_window}\n")
-        f.write(f"contact_bodyparts = {','.join(contact_bodyparts)}\n")
-        f.write(f"rhythm_bodyparts_aux = {','.join(rhythm_bodyparts)}\n")
-        f.write(f"event_method = {event_method}\n")
-        f.write(f"event_polarity_requested = {event_polarity}\n")
-        f.write(f"event_polarity_selected = {selected_polarity}\n")
-        f.write(f"min_cycle_duration_s = {min_cycle_s}\n")
-        f.write(f"max_cycle_duration_s = {max_cycle_s}\n")
-        f.write(f"prominence_used_px = {prominence}\n")
-        f.write(f"expected_period_frames = {expected_period if expected_period is not None else 'NA'}\n")
-        f.write(f"expected_period_s = {(expected_period / fps) if expected_period is not None and np.isfinite(expected_period) else 'NA'}\n")
-        f.write(f"n_events = {n_events}\n")
-        f.write(f"n_cycles_total = {n_cycles}\n")
-        f.write(f"n_cycles_accepted = {n_accepted}\n")
-        f.write("cycle_definition = interval between consecutive distal foot-strike-like events from toe+foot distal_x\n")
-        f.write("notes = hip/knee/ankle are exported only as auxiliary rhythm signals, not contact detectors.\n")
+    """Guarda un registro reproducible de la ejecución."""
+    lines = [
+        f"script = 01_preprocesamiento_y_ciclos.py",
+        f"algorithm_version = {ALGORITHM_VERSION}",
+        f"input_file = {input_file}",
+        f"fps = {fps}",
+        f"likelihood_min = {likelihood_min}",
+        f"max_gap_interpolation = {max_gap}",
+        f"analysis_smooth_window = {analysis_smooth_window}",
+        f"detection_smooth_window = {detection_smooth_window}",
+        f"min_cycle_duration_s = {min_cycle_s}",
+        f"max_cycle_duration_s = {max_cycle_s}",
+        f"toe_candidate_prominence_z = {prominence_z}",
+        f"expected_period_frames = {expected_period if expected_period is not None else 'NA'}",
+        f"expected_period_s = {(expected_period / fps) if expected_period is not None and np.isfinite(expected_period) else 'NA'}",
+        f"n_events = {n_events}",
+        f"n_cycles_total = {n_cycles}",
+        f"n_cycles_accepted = {n_accepted}",
+        "event_primary = local minimum of toe_x - hip_x",
+        "event_confirmation_A = nearby minimum of knee angle hip-knee-ankle",
+        "event_confirmation_B = nearby knee_x-hip_x extremum AND nearby hip angle crest-hip-knee extremum",
+        "synthetic_events = NEVER",
+        "manual_validation = detector logic visually validated on all 10 P30 videos",
+    ]
+    params_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
-
-# =============================================================================
-# PIPELINE PRINCIPAL
-# =============================================================================
 
 def run_pipeline(
     input_file: Path,
@@ -929,51 +777,59 @@ def run_pipeline(
     fps: float = FPS,
     likelihood_min: float = LIKELIHOOD_MIN,
     max_gap: int = MAX_GAP_INTERPOLATION,
-    smooth_window: int = SMOOTH_WINDOW,
-    contact_bodyparts: List[str] = CONTACT_BODY_PARTS,
-    rhythm_bodyparts: List[str] = RHYTHM_BODY_PARTS,
-    event_method: str = EVENT_METHOD,
-    event_polarity: str = EVENT_POLARITY,
+    analysis_smooth_window: int = ANALYSIS_SMOOTH_WINDOW,
+    detection_smooth_window: int = DETECTION_SMOOTH_WINDOW,
     min_cycle_s: float = MIN_CYCLE_DURATION_S,
     max_cycle_s: float = MAX_CYCLE_DURATION_S,
-    prominence_px: Optional[float] = DETECTION_PROMINENCE_PX,
-    merge_tolerance_frames: int = MERGE_TOLERANCE_FRAMES,
-    min_event_support: int = MIN_EVENT_SUPPORT,
+    prominence_z: float = DEFAULT_PROMINENCE_Z,
     norm_points: int = NORM_POINTS,
+    make_plot: bool = True,
 ) -> Dict[str, Path]:
+    """Ejecuta limpieza, detección multiseñal, construcción de ciclos y exportación."""
     input_file = Path(input_file)
     outdir = Path(outdir)
+    if not input_file.exists():
+        raise FileNotFoundError(f"No existe el archivo de entrada: {input_file}")
+    if fps <= 0:
+        raise ValueError("fps debe ser > 0")
+    if abs(float(fps) - 60.0) > 1e-9:
+        print(f"ADVERTENCIA: esta versión fue validada a 60 Hz; se solicitó fps={fps}.")
+
     outdir.mkdir(parents=True, exist_ok=True)
     stem = sanitize_stem(input_file)
 
-    print("\n=== 01_preprocesamiento_y_ciclos.py ===")
-    print(f"Entrada: {input_file}")
-    print(f"Salida:  {outdir}")
-    print(f"FPS:     {fps}")
-    print(f"Método:  {event_method} | polaridad solicitada: {event_polarity}")
-
     raw = read_dlc_file(input_file)
     flat = flatten_dlc_columns(raw)
+
     clean = clean_coordinates(
         flat=flat,
         likelihood_min=likelihood_min,
         max_gap=max_gap,
-        smooth_window=smooth_window,
+        smooth_window=analysis_smooth_window,
     )
+    if detection_smooth_window == analysis_smooth_window:
+        detection_clean = clean
+    else:
+        detection_clean = clean_coordinates(
+            flat=flat,
+            likelihood_min=likelihood_min,
+            max_gap=max_gap,
+            smooth_window=detection_smooth_window,
+        )
 
-    events, debug, event_signal, prominence, expected_period, selected_polarity = detect_distal_x_events(
-        clean=clean,
-        contact_bodyparts=contact_bodyparts,
-        rhythm_bodyparts=rhythm_bodyparts,
+    events, debug, event_signal, used_prominence, expected_period, selected_polarity = detect_multisignal_events(
+        clean=detection_clean,
+        contact_bodyparts=["toe"],
+        rhythm_bodyparts=["knee", "hip"],
         fps=fps,
-        event_method=event_method,
-        event_polarity=event_polarity,
+        event_method="multisignal_v2",
+        event_polarity="min",
         min_cycle_s=min_cycle_s,
         max_cycle_s=max_cycle_s,
-        prominence_px=prominence_px,
-        merge_tolerance_frames=merge_tolerance_frames,
-        min_event_support=min_event_support,
-        smooth_window=smooth_window,
+        prominence_px=prominence_z,
+        merge_tolerance_frames=3,
+        min_event_support=2,
+        smooth_window=detection_smooth_window,
     )
 
     cycles = build_cycles_from_events(
@@ -985,14 +841,14 @@ def run_pipeline(
         max_cycle_s=max_cycle_s,
         expected_period_frames=expected_period,
     )
-
-    normalized = normalize_cycles(clean=clean, cycles=cycles, n_points=norm_points, accepted_only=True)
+    normalized = normalize_cycles(clean, cycles, n_points=norm_points, accepted_only=True)
 
     clean_csv = outdir / f"{stem}_clean_coords.csv"
     events_csv = outdir / f"{stem}_events_detected.csv"
     cycles_csv = outdir / f"{stem}_gait_cycles.csv"
     norm_csv = outdir / f"{stem}_normalized_cycles.csv"
     debug_csv = outdir / f"{stem}_cycle_detection_signals.csv"
+    rejected_csv = outdir / f"{stem}_rejected_event_candidates.csv"
     check_png = outdir / f"{stem}_cycle_detection_check.png"
     params_txt = outdir / f"{stem}_params.txt"
 
@@ -1001,119 +857,94 @@ def run_pipeline(
     cycles.to_csv(cycles_csv, index=False)
     normalized.to_csv(norm_csv, index=False)
     debug.to_csv(debug_csv, index=True)
+    pd.DataFrame(debug.attrs.get("rejected_candidates", [])).to_csv(rejected_csv, index=False)
 
-    plot_cycle_detection_check(
-        clean=clean,
-        events=events,
-        cycles=cycles,
-        debug=debug,
-        out_png=check_png,
-        fps=fps,
-        event_method=event_method,
-        selected_polarity=selected_polarity,
-    )
+    if make_plot:
+        plot_cycle_detection_check(
+            clean=clean,
+            events=events,
+            cycles=cycles,
+            debug=debug,
+            out_png=check_png,
+            fps=fps,
+            event_method="multisignal_v2",
+            selected_polarity=selected_polarity,
+        )
 
-    n_events = 0 if events.empty else len(events)
-    n_cycles = 0 if cycles.empty else len(cycles)
-    n_accepted = 0 if cycles.empty else int((cycles["accepted"] == 1).sum())
-
+    n_events = len(events)
+    n_cycles = len(cycles)
+    n_accepted = int((cycles["accepted"] == 1).sum()) if not cycles.empty else 0
     write_params(
         params_file=params_txt,
         input_file=input_file,
         fps=fps,
         likelihood_min=likelihood_min,
         max_gap=max_gap,
-        smooth_window=smooth_window,
-        contact_bodyparts=parse_bodypart_list(contact_bodyparts),
-        rhythm_bodyparts=parse_bodypart_list(rhythm_bodyparts),
-        event_method=event_method,
-        event_polarity=event_polarity,
-        selected_polarity=selected_polarity,
+        analysis_smooth_window=analysis_smooth_window,
+        detection_smooth_window=detection_smooth_window,
         min_cycle_s=min_cycle_s,
         max_cycle_s=max_cycle_s,
-        prominence=prominence,
+        prominence_z=used_prominence,
         expected_period=expected_period,
         n_events=n_events,
         n_cycles=n_cycles,
         n_accepted=n_accepted,
     )
 
-    print("\nArchivos generados:")
-    print(f"  Coordenadas limpias:      {clean_csv}")
-    print(f"  Eventos detectados:       {events_csv}")
-    print(f"  Ciclos de marcha:         {cycles_csv}")
-    print(f"  Ciclos normalizados:      {norm_csv}")
-    print(f"  Señales de detección:     {debug_csv}")
-    print(f"  Gráfico de control:       {check_png}")
-    print(f"  Parámetros:               {params_txt}")
-    print("\nResumen:")
-    print(f"  Eventos detectados:       {n_events}")
-    print(f"  Ciclos totales:           {n_cycles}")
-    print(f"  Ciclos aceptados:         {n_accepted}")
-    print(f"  Polaridad seleccionada:   {selected_polarity}")
-    if expected_period is not None and np.isfinite(expected_period):
-        print(f"  Periodo estimado:         {expected_period:.2f} frames = {expected_period/fps:.3f} s")
-    print("\nIMPORTANTE: revisar siempre el PNG de control antes de seguir al código 02/03.\n")
-
+    print(f"{stem}: {n_events} eventos -> {n_cycles} ciclos ({n_accepted} aceptados)")
     return {
         "clean_coords": clean_csv,
         "events_detected": events_csv,
         "gait_cycles": cycles_csv,
         "normalized_cycles": norm_csv,
         "cycle_detection_signals": debug_csv,
+        "rejected_event_candidates": rejected_csv,
         "cycle_detection_check": check_png,
         "params": params_txt,
     }
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Primera parte corregida: leer DLC, limpiar coordenadas, detectar ciclos toe+foot distal_x con MIN estandarizado y normalizar 0-100%."
+    p = argparse.ArgumentParser(
+        description=(
+            "Detecta ciclos de marcha P30 con el algoritmo multiseñal validado: "
+            "Toe relativo + ángulo de rodilla, con respaldo Knee/cadera."
+        )
     )
-    parser.add_argument("input_file", type=str, help="Archivo .h5 o .csv de DeepLabCut.")
-    parser.add_argument("--outdir", type=str, default="salida_01_ciclos", help="Carpeta de salida.")
-    parser.add_argument("--fps", type=float, default=FPS, help="Frames por segundo del video. Default: 60.")
-    parser.add_argument("--likelihood-min", type=float, default=LIKELIHOOD_MIN, help="Umbral mínimo de likelihood.")
-    parser.add_argument("--max-gap", type=int, default=MAX_GAP_INTERPOLATION, help="Gaps máximos a interpolar.")
-    parser.add_argument("--smooth-window", type=int, default=SMOOTH_WINDOW, help="Ventana de suavizado; se fuerza impar.")
-    parser.add_argument("--contact-bodyparts", type=str, default=",".join(CONTACT_BODY_PARTS), help="Puntos distales para detectar ciclos. Ej: toe,foot")
-    parser.add_argument("--rhythm-bodyparts", type=str, default=",".join(RHYTHM_BODY_PARTS), help="Puntos auxiliares de ritmo para exportar. No definen contacto.")
-    parser.add_argument("--event-method", type=str, default=EVENT_METHOD, choices=["distal_x", "distal_y", "velocity_x"], help="Método de detección.")
-    parser.add_argument("--event-polarity", type=str, default=EVENT_POLARITY, choices=["auto", "max", "min"], help="Extremo que define el inicio del ciclo. Default corregido: min para este montaje experimental. Use auto solo como diagnóstico y valide el PNG.")
-    parser.add_argument("--min-cycle-s", type=float, default=MIN_CYCLE_DURATION_S, help="Duración mínima aceptada del ciclo en segundos.")
-    parser.add_argument("--max-cycle-s", type=float, default=MAX_CYCLE_DURATION_S, help="Duración máxima aceptada del ciclo en segundos.")
-    parser.add_argument("--prominence", type=float, default=None, help="Prominencia manual en pixeles. Si se omite, se calcula automático.")
-    parser.add_argument("--merge-tolerance-frames", type=int, default=MERGE_TOLERANCE_FRAMES, help="Tolerancia para soporte toe/foot.")
-    parser.add_argument("--min-event-support", type=int, default=MIN_EVENT_SUPPORT, help="Soporte mínimo de señales. Recomendado 1 o 2.")
-    parser.add_argument("--norm-points", type=int, default=NORM_POINTS, help="Puntos para normalización 0-100%. Default: 101.")
-    return parser
+    p.add_argument("input_file", type=Path, help="Archivo DeepLabCut .h5/.hdf5 o .csv")
+    p.add_argument("--outdir", type=Path, default=Path("salida_01_ciclos"))
+    p.add_argument("--fps", type=float, default=FPS)
+    p.add_argument("--likelihood-min", type=float, default=LIKELIHOOD_MIN)
+    p.add_argument("--max-gap", type=int, default=MAX_GAP_INTERPOLATION)
+    p.add_argument("--analysis-smooth-window", type=int, default=ANALYSIS_SMOOTH_WINDOW)
+    p.add_argument("--detection-smooth-window", type=int, default=DETECTION_SMOOTH_WINDOW)
+    p.add_argument("--min-cycle-s", type=float, default=MIN_CYCLE_DURATION_S)
+    p.add_argument("--max-cycle-s", type=float, default=MAX_CYCLE_DURATION_S)
+    p.add_argument("--prominence-z", type=float, default=DEFAULT_PROMINENCE_Z)
+    p.add_argument("--norm-points", type=int, default=NORM_POINTS)
+    p.add_argument("--no-plot", action="store_true", help="No generar PNG de control")
+    return p
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_arg_parser()
-    args = parser.parse_args(argv)
-
+    args = build_arg_parser().parse_args(argv)
     try:
         run_pipeline(
-            input_file=Path(args.input_file),
-            outdir=Path(args.outdir),
+            input_file=args.input_file,
+            outdir=args.outdir,
             fps=args.fps,
             likelihood_min=args.likelihood_min,
             max_gap=args.max_gap,
-            smooth_window=args.smooth_window,
-            contact_bodyparts=parse_bodypart_list(args.contact_bodyparts),
-            rhythm_bodyparts=parse_bodypart_list(args.rhythm_bodyparts),
-            event_method=args.event_method,
-            event_polarity=args.event_polarity,
+            analysis_smooth_window=args.analysis_smooth_window,
+            detection_smooth_window=args.detection_smooth_window,
             min_cycle_s=args.min_cycle_s,
             max_cycle_s=args.max_cycle_s,
-            prominence_px=args.prominence,
-            merge_tolerance_frames=args.merge_tolerance_frames,
-            min_event_support=args.min_event_support,
+            prominence_z=args.prominence_z,
             norm_points=args.norm_points,
+            make_plot=not args.no_plot,
         )
     except Exception as exc:
-        print(f"\nERROR: {exc}", file=sys.stderr)
+        print(f"ERROR: {exc}")
         return 1
     return 0
 
