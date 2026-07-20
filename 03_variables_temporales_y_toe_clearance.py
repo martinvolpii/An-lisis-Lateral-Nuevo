@@ -39,15 +39,26 @@ script 01, se puede omitir --cycles:
 
 Definiciones usadas:
     - Tiempo de zancada: tiempo entre start_frame y end_frame del ciclo.
-    - Apoyo: desde foot strike inicial hasta toe-off estimado.
-    - Oscilación: desde toe-off estimado hasta el siguiente foot strike.
+    - Apoyo cinemático estimado: desde el evento inicial validado del ciclo hasta toe-off estimado.
+    - Oscilación cinemática estimada: desde toe-off estimado hasta el siguiente evento de ciclo.
     - Toe clearance: elevación máxima del toe durante la oscilación respecto al
       nivel de contacto estimado del ciclo, en pixeles.
 
 Nota importante:
+    El inicio del ciclo es un evento cinemático repetitivo validado visualmente,
+    no una medición directa de fuerza de contacto. Por ello stance/swing se
+    interpretan como estimaciones cinemáticas de fase hasta una validación
+    independiente de foot-strike/toe-off.
+
     La detección de toe-off es una estimación conservadora basada en la elevación
     vertical del toe/foot dentro de ciclos ya validados. El gráfico de control es
     obligatorio para revisar si las fases están bien cortadas.
+
+Versión P30 validada para 60 Hz:
+- Límites mínimos de apoyo/oscilación: 2 frames (33.3 ms).
+- Confirmación sostenida de toe-off: 2 frames.
+- Umbral vertical conservado en 25% del rango vertical del ciclo (mínimo 2 px).
+- No se inventa toe-off: los ciclos sin cruce válido quedan con accepted_temporal=0.
 
 Autor: pipeline preparado para análisis DLC de marcha murina.
 """
@@ -98,12 +109,14 @@ TOE_OFF_THRESHOLD_FRACTION = 0.25
 MIN_CLEARANCE_THRESHOLD_PX = 2.0
 
 # Duraciones mínimas para aceptar apoyo/oscilación.
-# A 60 FPS, 0.05 s ≈ 3 frames.
-MIN_STANCE_DURATION_S = 0.05
-MIN_SWING_DURATION_S = 0.05
+# En P30 hay ciclos reales de 5-8 frames; exigir 3+3 frames haría imposible varios ciclos.
+# Se exige un mínimo conservador de 2 frames por fase.
+MIN_STANCE_DURATION_S = 2.0 / FPS  # 2 frames = 33.3 ms a 60 Hz
+MIN_SWING_DURATION_S = 2.0 / FPS  # 2 frames = 33.3 ms a 60 Hz
 
 # Número de frames consecutivos que deben superar el umbral para declarar toe-off.
-SUSTAIN_FRAMES = 4
+# Se usan 2 frames para confirmar elevación sin exigir 4 frames dentro de ciclos muy rápidos.
+SUSTAIN_FRAMES = 2  # compatible con ciclos rápidos de 5-8 frames a 60 Hz
 
 # Si True, muestra gráficos al terminar.
 SHOW_PLOTS = False
@@ -274,7 +287,12 @@ def first_sustained_crossing(
     end_idx_exclusive: int,
     sustain_frames: int,
 ) -> Optional[int]:
-    """Devuelve el primer índice donde elevation supera el umbral de forma sostenida."""
+    """Devuelve el primer inicio permitido donde elevation supera el umbral de forma sostenida.
+
+    ``end_idx_exclusive`` limita dónde puede INICIARSE el toe-off; la ventana de
+    confirmación puede extenderse después de ese límite mientras permanezca dentro
+    del ciclo. Esto evita rechazar artificialmente ciclos rápidos.
+    """
     sustain_frames = max(1, int(sustain_frames))
     start_idx = max(0, int(start_idx))
     end_idx_exclusive = min(len(elevation), int(end_idx_exclusive))
@@ -282,8 +300,11 @@ def first_sustained_crossing(
     if end_idx_exclusive <= start_idx:
         return None
 
-    last_start = end_idx_exclusive - sustain_frames + 1
-    for idx in range(start_idx, max(start_idx, last_start)):
+    # ``end_idx_exclusive`` limita el INICIO permitido del toe-off para dejar
+    # al menos ``min_swing_frames`` de oscilación. No debe truncar la ventana
+    # de confirmación: los ``sustain_frames`` posteriores al cruce forman parte
+    # precisamente de la fase de swing y pueden extenderse más allá de ese límite.
+    for idx in range(start_idx, end_idx_exclusive):
         window = elevation[idx:idx + sustain_frames]
         if len(window) < sustain_frames:
             continue
@@ -664,7 +685,8 @@ def write_params(
         f.write(f"sustain_frames = {sustain_frames}\n")
         f.write(f"n_cycles_analyzed = {n_cycles}\n")
         f.write(f"n_cycles_temporal_valid = {n_valid}\n")
-        f.write("definitions = stride_duration: start_frame to end_frame; stance: start_frame to toe_off; swing: toe_off to end_frame; toe_clearance: max elevation during swing relative to contact level\n")
+        f.write("definitions = stride_duration: start_frame to end_frame; stance_estimated: cycle_start_event to estimated_toe_off; swing_estimated: estimated_toe_off to cycle_end_event; toe_clearance: max elevation during estimated swing relative to estimated contact level\n")
+        f.write("phase_semantics = kinematic_estimates_not_force_plate_ground_truth\n")
 
 
 def run_pipeline(
@@ -869,19 +891,19 @@ def build_argparser() -> argparse.ArgumentParser:
         "--min-stance-s",
         type=float,
         default=MIN_STANCE_DURATION_S,
-        help="Duración mínima de apoyo para aceptar un ciclo. Por defecto: 0.05 s.",
+        help="Duración mínima de apoyo estimado. P30: 2 frames = 0.0333 s a 60 Hz.",
     )
     parser.add_argument(
         "--min-swing-s",
         type=float,
         default=MIN_SWING_DURATION_S,
-        help="Duración mínima de oscilación para aceptar un ciclo. Por defecto: 0.05 s.",
+        help="Duración mínima de oscilación estimada. P30: 2 frames = 0.0333 s a 60 Hz.",
     )
     parser.add_argument(
         "--sustain-frames",
         type=int,
         default=SUSTAIN_FRAMES,
-        help="Frames consecutivos sobre umbral para detectar toe-off. Por defecto: 4.",
+        help="Frames consecutivos sobre umbral para detectar toe-off. P30: 2.",
     )
     parser.add_argument(
         "--show-plots",
