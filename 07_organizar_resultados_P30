@@ -1,0 +1,156 @@
+from pathlib import Path
+import shutil, glob, os
+import pandas as pd
+
+SRC=Path('/mnt/data/P30_work')
+DST=Path('/mnt/data/P30')
+if DST.exists(): shutil.rmtree(DST)
+(DST/'Individual').mkdir(parents=True)
+G= DST/'Grupal comparativo'
+(G/'General'/'Goniometría').mkdir(parents=True)
+(G/'General'/'Control de calidad').mkdir(parents=True)
+(G/'WT').mkdir(parents=True)
+(G/'SOD1').mkdir(parents=True)
+(G/'WT vs SOD1').mkdir(parents=True)
+
+animals=['856','857','859','860','861','862','863','864','865','867']
+sel_all=pd.read_csv(SRC/'05'/'selected_top_cycles.csv')
+summary=pd.read_csv(SRC/'resumen_ejecucion.csv')
+
+joint_angle={'hip':'hip_angle_deg','knee':'knee_angle_deg','ankle':'ankle_angle_deg','foot':'foot_angle_deg'}
+joint_label={'hip':'Cadera','knee':'Rodilla','ankle':'Tobillo','foot':'Pie'}
+
+def one(pattern):
+    xs=glob.glob(str(pattern))
+    if len(xs)!=1:
+        raise RuntimeError(f'Esperaba 1 archivo para {pattern}, encontré {len(xs)}')
+    return Path(xs[0])
+
+def copy(src,dst):
+    dst.parent.mkdir(parents=True,exist_ok=True)
+    shutil.copy2(src,dst)
+
+for aid in animals:
+    root=DST/'Individual'/aid
+    cycdir=root/'Ciclos'
+    gonfull=root/'Goniometría'/'Completa'
+    gontop=root/'Goniometría'/'Top 10'
+    tempdir=root/'Variables temporales'
+    resdir=root/'Resumen'
+    for d in [cycdir,gonfull,gontop,tempdir,resdir]: d.mkdir(parents=True,exist_ok=True)
+
+    s1=SRC/aid/'01'; s2=SRC/aid/'02'; s3=SRC/aid/'03'
+    mapping1={
+      '*_clean_coords.csv':'coordenadas_limpias.csv',
+      '*_events_detected.csv':'eventos_detectados.csv',
+      '*_gait_cycles.csv':'ciclos.csv',
+      '*_normalized_cycles.csv':'ciclos_normalizados.csv',
+      '*_cycle_detection_signals.csv':'senales_deteccion.csv',
+      '*_rejected_event_candidates.csv':'candidatos_rechazados.csv',
+      '*_cycle_detection_check.png':'control_ciclos.png',
+      '*_params.txt':'parametros.txt',
+    }
+    for pat,name in mapping1.items(): copy(one(s1/pat),cycdir/name)
+
+    mapping2={
+      '*_frame_angles.csv':'angulos_por_frame.csv',
+      '*_cycle_angle_profiles.csv':'perfiles_por_ciclo.csv',
+      '*_cycle_angle_ranges.csv':'rangos_por_ciclo.csv',
+      '*_angle_range_summary.csv':'resumen_rangos.csv',
+      '*_angle_profiles.png':'perfiles.png',
+      '*_angle_cycle_control.png':'control_goniometria.png',
+      '*_goniometry_params.txt':'parametros.txt',
+    }
+    for pat,name in mapping2.items(): copy(one(s2/pat),gonfull/name)
+
+    mapping3={
+      '*_gait_temporal_by_cycle.csv':'variables_por_ciclo.csv',
+      '*_gait_temporal_video_summary.csv':'resumen_video.csv',
+      '*_gait_temporal_control.png':'control_fases.png',
+      '*_toe_clearance_control.png':'control_toe_clearance.png',
+      '*_temporal_params.txt':'parametros.txt',
+    }
+    for pat,name in mapping3.items(): copy(one(s3/pat),tempdir/name)
+
+    # Top 10 selection for this animal from script 05
+    ssel=sel_all[sel_all['dataset_id'].astype(str).str.startswith(aid+'__')].copy()
+    ssel['articulacion']=ssel['joint'].map(joint_label)
+    keep=['articulacion','joint','selection_rank','cycle_id','max_angle_deg','start_frame','end_frame','duration_frames','duration_s','selection_rule']
+    ssel[keep].to_csv(gontop/'ciclos_seleccionados.csv',index=False)
+
+    ranges=pd.read_csv(one(s2/'*_cycle_angle_ranges.csv'))
+    profiles=pd.read_csv(one(s2/'*_cycle_angle_profiles.csv'))
+    range_rows=[]; profile_rows=[]
+    for _,r in ssel.iterrows():
+        j=str(r['joint']); cid=int(r['cycle_id']); rank=int(r['selection_rank'])
+        rr=ranges[ranges['cycle_id']==cid].copy()
+        cols=['cycle_id','start_frame','end_frame','duration_frames','duration_s',
+              f'{j}_finite_fraction',f'{j}_min_deg',f'{j}_max_deg',f'{j}_range_deg',f'{j}_mean_deg',f'{j}_sd_deg']
+        rr=rr[[c for c in cols if c in rr.columns]].copy()
+        rr.insert(0,'ranking_top10',rank); rr.insert(0,'articulacion',joint_label[j])
+        range_rows.append(rr)
+        pp=profiles[profiles['cycle_id']==cid].copy()
+        anglecol=joint_angle[j]
+        pcols=[c for c in ['cycle_id','percent_gait_cycle',anglecol] if c in pp.columns]
+        pp=pp[pcols].copy()
+        pp.insert(0,'angulo',anglecol); pp.insert(0,'ranking_top10',rank); pp.insert(0,'articulacion',joint_label[j])
+        profile_rows.append(pp)
+    pd.concat(range_rows,ignore_index=True).to_csv(gontop/'rangos_top10.csv',index=False)
+    pd.concat(profile_rows,ignore_index=True).to_csv(gontop/'perfiles_top10.csv',index=False)
+
+    # Copy generated colored plot
+    p_png=one(SRC/'05'/'por_dataset'/f'{aid}__*_goniometria_top10.png')
+    p_pdf=one(SRC/'05'/'por_dataset'/f'{aid}__*_goniometria_top10.pdf')
+    copy(p_png,gontop/'grafico_top10.png'); copy(p_pdf,gontop/'grafico_top10.pdf')
+
+    # One-row animal summary
+    row=summary[summary['Animal'].astype(str)==aid].copy()
+    row.to_csv(resdir/'resumen_animal.csv',index=False)
+    t=pd.read_csv(tempdir/'variables_por_ciclo.csv')
+    rejects=t[t['accepted_temporal']!=1]['reject_reason'].fillna('sin_detalle').value_counts().to_dict()
+    txt=(
+      f'Animal {aid}\n'
+      f'Ciclos detectados y aceptados: {int(row.iloc[0]["Ciclos aceptados"])}\n'
+      f'Ciclos con goniometría: {int(row.iloc[0]["Ciclos goniometría"])}\n'
+      f'Ciclos temporales válidos: {int(row.iloc[0]["Ciclos temporales válidos"])}\n'
+      f'Ciclos temporales rechazados: {int(row.iloc[0]["Ciclos temporales rechazados"])}\n'
+      f'Razones de rechazo temporal: {rejects if rejects else "ninguna"}\n\n'
+      'Goniometría Top 10: selección independiente por articulación usando los 10 ciclos con mayor ángulo máximo.\n'
+      'La goniometría completa se conserva íntegra y no es reemplazada por la selección Top 10.\n'
+      'Las variables dependientes de toe-off usan su propio control de calidad temporal.\n'
+    )
+    (resdir/'resumen.txt').write_text(txt,encoding='utf-8')
+
+# General group outputs (without genotype assignment)
+summary.to_csv(G/'General'/'resumen_individual.csv',index=False)
+copy(SRC/'04'/'Resumen_P30.xlsx',G/'General'/'Resumen_P30.xlsx')
+copy(SRC/'05'/'resumen_goniometria_top10_todos_datasets.png',G/'General'/'Goniometría'/'resumen_top10_todos_los_animales.png')
+copy(SRC/'05'/'resumen_goniometria_top10_todos_datasets.pdf',G/'General'/'Goniometría'/'resumen_top10_todos_los_animales.pdf')
+# simplified selected table
+sel_simple=sel_all.copy()
+sel_simple['animal']=sel_simple['dataset_id'].str.extract(r'^(\d+)')
+sel_simple['articulacion']=sel_simple['joint'].map(joint_label)
+cols=['animal','articulacion','selection_rank','cycle_id','max_angle_deg','start_frame','end_frame','duration_frames','duration_s']
+sel_simple[cols].to_csv(G/'General'/'Goniometría'/'ciclos_top10_seleccionados.csv',index=False)
+copy(SRC/'cycle_controls_montage.jpg',G/'General'/'Control de calidad'/'controles_ciclos_todos.jpg')
+
+note=(
+'ASIGNACIÓN DE GRUPOS PENDIENTE\n\n'
+'Los archivos H5 recibidos identifican a los animales por número, pero no contienen una etiqueta de genotipo WT/SOD1.\n'
+'Por rigor científico no se asignaron grupos por numeración ni por orden de archivo.\n'
+'Cuando se disponga de la correspondencia animal -> grupo, estas carpetas deben poblarse con los resúmenes por animal y la comparación WT vs SOD1.\n\n'
+'Animales procesados: 856, 857, 859, 860, 861, 862, 863, 864, 865, 867.\n'
+)
+for d in [G/'WT',G/'SOD1',G/'WT vs SOD1']:
+    (d/'ASIGNACION_PENDIENTE.txt').write_text(note,encoding='utf-8')
+
+readme=(
+'P30 - ORGANIZACIÓN DEL ANÁLISIS\n\n'
+'Individual: resultados completos por animal, separados en Ciclos, Goniometría, Variables temporales y Resumen.\n'
+'Goniometría/Completa: conserva todos los ciclos válidos del detector.\n'
+'Goniometría/Top 10: selección independiente por articulación de los 10 ciclos con mayor ángulo máximo, con tablas de trazabilidad y gráficos en color.\n'
+'Grupal comparativo/General: consolidación descriptiva de los 10 animales y control de calidad global.\n'
+'WT, SOD1 y WT vs SOD1: estructura creada, pendiente únicamente de la asignación experimental de genotipo porque esa información no está contenida en los H5.\n'
+)
+(G/'General'/'LEEME.txt').write_text(readme,encoding='utf-8')
+print('Organizado en',DST)
